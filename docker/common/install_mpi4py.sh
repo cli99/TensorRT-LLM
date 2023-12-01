@@ -9,3 +9,5 @@ curl -L ${RELEASE_URL} | tar -zx -C /tmp
 sed -i 's/>= 40\.9\.0/>= 40.9.0, < 69/g' /tmp/mpi4py-${MPI4PY_VERSION}/pyproject.toml
 pip install /tmp/mpi4py-${MPI4PY_VERSION}
 rm -rf /tmp/mpi4py*
+
+# https://stackoverflow.com/questions/72680287/not-able-to-install-mpi4py-using-pip
