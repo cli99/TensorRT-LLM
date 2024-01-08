@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,11 +33,8 @@ engine_target_path = _pl.Path(__file__).parent.parent / "models/rt_engine"
 import build as _ecb
 
 
-def build_engine(model_name: str, weight_dir: _pl.Path, engine_dir: _pl.Path,
-                 world_size, *args):
+def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, world_size, *args):
     args = [
-        '-m',
-        str(model_name),
         '--log_level=error',
         '--model_dir',
         str(weight_dir),
@@ -76,6 +73,11 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
          str(resources_dir) + "/requirements.txt"],
         cwd=resources_dir)
 
+    # chatglm needs 4.33.1 in case of tokenizer issues
+    # AttributeError: 'ChatGLMTokenizer' object has no attribute 'sp_tokenizer'. Did you mean: '_tokenize'?
+    run_command(["pip", "install", "--force-reinstall", "transformers==4.33.1"],
+                cwd=resources_dir)
+
     # Clone the model directory
     for model_name, hf_dir in zip(model_name_list, hf_dir_list):
         if not _Path(hf_dir).exists():
@@ -94,7 +96,7 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
     for model_name, hf_dir, trt_dir in zip(model_name_list, hf_dir_list,
                                            trt_dir_list):
         print("Building %s" % model_name)
-        build_engine(model_name, hf_dir, trt_dir, world_size)
+        build_engine(hf_dir, trt_dir, world_size)
 
     if not _Path(engine_target_path).exists():
         _Path(engine_target_path).mkdir(parents=True, exist_ok=True)

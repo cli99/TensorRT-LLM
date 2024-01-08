@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,23 +18,22 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/inferenceRequest.h"
-#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/pybind/batch_manager/namedTensor.h"
 
 #include <ATen/ATen.h>
+#include <pybind11/pybind11.h>
 
-#include <ATen/ops/tensor.h>
 #include <memory>
 #include <optional>
 
 namespace tensorrt_llm::pybind::batch_manager
 {
 
-class InferenceRequest : public tensorrt_llm::batch_manager::GenericInferenceRequest<at::Tensor,
-                             std::unordered_map<std::string, at::Tensor>>
+class InferenceRequest
+    : public tensorrt_llm::batch_manager::GenericInferenceRequest<std::optional<at::Tensor>, NamedTensor>
 {
 public:
-    using Base
-        = tensorrt_llm::batch_manager::GenericInferenceRequest<at::Tensor, std::unordered_map<std::string, at::Tensor>>;
+    using Base = tensorrt_llm::batch_manager::GenericInferenceRequest<std::optional<at::Tensor>, NamedTensor>;
     using TensorPtr = Base::TensorPtr;
     using TensorMap = Base::TensorMap;
 
@@ -43,17 +42,18 @@ public:
     {
     }
 
-    InferenceRequest(TensorMap const& inputTensors, uint64_t requestId)
-        : Base(inputTensors, requestId)
+    InferenceRequest(uint64_t requestId, TensorMap const& inputTensors)
+        : Base{requestId, inputTensors}
     {
     }
 
-    InferenceRequest(TensorMap&& inputTensors, uint64_t requestId)
-        : Base(inputTensors, requestId)
+    InferenceRequest(uint64_t requestId, TensorMap&& inputTensors)
+        : Base{requestId, std::move(inputTensors)}
     {
     }
 
     [[nodiscard]] std::shared_ptr<tensorrt_llm::batch_manager::InferenceRequest> toTrtLlm() const;
+    static void initBindings(pybind11::module_& m);
 };
 
 } // namespace tensorrt_llm::pybind::batch_manager

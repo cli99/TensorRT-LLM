@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -32,9 +32,10 @@ namespace tensorrt_llm::runtime
 class GptJsonConfig
 {
 public:
-    GptJsonConfig(std::string name, std::string precision, SizeType tensorParallelism, SizeType pipelineParallelism,
-        GptModelConfig const& modelConfig)
+    GptJsonConfig(std::string name, std::string version, std::string precision, SizeType tensorParallelism,
+        SizeType pipelineParallelism, GptModelConfig const& modelConfig)
         : mName(std::move(name))
+        , mVersion(std::move(version))
         , mPrecision(std::move(precision))
         , mTensorParallelism{tensorParallelism}
         , mPipelineParallelism{pipelineParallelism}
@@ -56,6 +57,11 @@ public:
     [[nodiscard]] std::string const& getName() const
     {
         return mName;
+    }
+
+    [[nodiscard]] std::string const& getVersion() const
+    {
+        return mVersion;
     }
 
     [[nodiscard]] std::string const& getPrecision() const
@@ -87,6 +93,7 @@ public:
 
 private:
     std::string const mName;
+    std::string const mVersion;
     std::string const mPrecision;
     SizeType const mTensorParallelism;
     SizeType const mPipelineParallelism;

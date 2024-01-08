@@ -104,7 +104,6 @@ class Layer:
     # list of TRT layers.
     TRT_LAYER_TYPE_TO_LAYER = {
         trt.LayerType.CONVOLUTION: trt.IConvolutionLayer,
-        trt.LayerType.FULLY_CONNECTED: trt.IFullyConnectedLayer,
         trt.LayerType.ACTIVATION: trt.IActivationLayer,
         trt.LayerType.POOLING: trt.IPoolingLayer,
         trt.LayerType.LRN: trt.ILRNLayer,
@@ -122,7 +121,6 @@ class Layer:
         trt.LayerType.MATRIX_MULTIPLY: trt.IMatrixMultiplyLayer,
         trt.LayerType.RAGGED_SOFTMAX: trt.IRaggedSoftMaxLayer,
         trt.LayerType.CONSTANT: trt.IConstantLayer,
-        trt.LayerType.RNN_V2: trt.IRNNv2Layer,
         trt.LayerType.IDENTITY: trt.IIdentityLayer,
         trt.LayerType.PLUGIN_V2: trt.IPluginV2Layer,
         trt.LayerType.SLICE: trt.ISliceLayer,
@@ -410,14 +408,9 @@ class FLayerInfo:
         def _swap_tensor_info(new, deprecated):
             name = deprecated.trt_tensor.name
             deprecated.trt_tensor.name = name + '_deprecated'
-            from ._common import default_net
             from .functional import cast
 
-            if default_net().strongly_typed:
-                if new.trt_tensor.dtype != deprecated.trt_tensor.dtype:
-                    new = cast(new, deprecated.trt_tensor.dtype)
-            else:
-                new.trt_tensor.dtype = deprecated.trt_tensor.dtype
+            new = cast(new, deprecated.dtype)
             new.trt_tensor.name = name
 
         def _reset_network_output_tensors(network, out, new_out):
@@ -426,16 +419,18 @@ class FLayerInfo:
             need_to_mark = False
             for i in range(num_outputs):
                 net_outputs.append(network._trt_network.get_output(i))
-                if out.trt_tensor is net_outputs[i]: need_to_mark = True
-            if need_to_mark is False: return
+                if out.trt_tensor is net_outputs[i]:
+                    need_to_mark = True
+            if need_to_mark is False:
+                return
             for output in net_outputs:
                 network.trt_network.unmark_output(output)
             for i in range(num_outputs):
-                network.trt_network.mark_output(
-                    new_out.trt_tensor
-                ) if net_outputs[
-                    i] is out.trt_tensor else network.trt_network.mark_output(
-                        net_outputs[i])
+                if net_outputs[i] is out.trt_tensor:
+                    network.trt_network.mark_output(new_out.trt_tensor)
+                    new_out.trt_tensor.dtype = out.trt_tensor.dtype
+                else:
+                    network.trt_network.mark_output(net_outputs[i])
 
         def replace_all_uses_with(out, new_out):
             if isinstance(out, Tensor):
@@ -631,7 +626,7 @@ class FuseAttentionWithBiasPass(PatternRewriter):
             if not self.is_attention_plugin(layer):
                 return False
             plugin_flayer = FLayerInfoMemo.instance().get(layer.name)
-            input = plugin_flayer.raw_inputs['tensor']
+            input = plugin_flayer.raw_inputs['qkv']
             if input is None or len(list(input.get_users())) != 1:
                 return False
             parent_layer = input.get_parent()
@@ -644,7 +639,7 @@ class FuseAttentionWithBiasPass(PatternRewriter):
                 return False
             if plugin_flayer.raw_inputs['qkv_bias'] is not None:
                 return False
-            plugin_flayer.raw_inputs['tensor'] = eltwise_mutable_inputs[0]
+            plugin_flayer.raw_inputs['qkv'] = eltwise_mutable_inputs[0]
             plugin_flayer.raw_inputs['qkv_bias'] = eltwise_const_inputs[0]
             from .functional import gpt_attention
             new_outputs = gpt_attention(**plugin_flayer.raw_inputs)

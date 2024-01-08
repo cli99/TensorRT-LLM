@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -57,6 +57,7 @@ def build_trt_llm(python_exe: str,
                   root_dir: _pl.Path,
                   build_dir: _pl.Path,
                   cuda_architectures: _tp.Optional[str] = None,
+                  use_ccache: _tp.Optional[bool] = False,
                   dist_dir: _tp.Optional[str] = None,
                   trt_root: _tp.Optional[str] = None):
     # Build wheel again to WAR issue that the "google-tests" target needs the cmake generated files
@@ -68,8 +69,12 @@ def build_trt_llm(python_exe: str,
         python_exe, "scripts/build_wheel.py", "--cuda_architectures",
         cuda_architectures, "--build_dir",
         str(build_dir), "--dist_dir",
-        str(dist_dir)
+        str(dist_dir), "--python_bindings"
     ]
+
+    if use_ccache:
+        build_wheel.append("--use_ccache")
+
     if trt_root is not None:
         build_wheel += ["--trt_root", str(trt_root)]
 
@@ -90,10 +95,11 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
               skip_gptj=False,
               skip_llama=False,
               skip_chatglm=False,
-              only_fp8=False,
+              run_fp8=False,
               only_multi_gpu=False,
               trt_root: _tp.Optional[str] = None,
-              build_only=False) -> None:
+              build_only=False,
+              use_ccache=False) -> None:
     root_dir = find_root_dir()
     _log.info("Using root directory: %s", str(root_dir))
 
@@ -105,6 +111,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                   root_dir=root_dir,
                   build_dir=build_dir,
                   cuda_architectures=cuda_architectures,
+                  use_ccache=use_ccache,
                   dist_dir=dist_dir,
                   trt_root=trt_root)
 
@@ -120,7 +127,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                                 skip_gptj=skip_gptj,
                                 skip_llama=skip_llama,
                                 skip_chatglm=skip_chatglm,
-                                only_fp8=only_fp8)
+                                run_fp8=run_fp8)
 
         if build_only:
             return
@@ -130,7 +137,7 @@ def run_tests(cuda_architectures: _tp.Optional[str] = None,
                          skip_gptj=skip_gptj,
                          skip_llama=skip_llama,
                          skip_chatglm=skip_chatglm,
-                         only_fp8=only_fp8)
+                         run_fp8=run_fp8)
 
         if not skip_gpt:
             run_benchmarks(python_exe=python_exe,
@@ -160,9 +167,9 @@ def prepare_all_model_tests(python_exe: str,
                             skip_gptj=False,
                             skip_llama=False,
                             skip_chatglm=False,
-                            only_fp8=False):
+                            run_fp8=False):
     model_cache_arg = ["--model_cache", model_cache] if model_cache else []
-    only_fp8_arg = ["--only_fp8"] if only_fp8 else []
+    only_fp8_arg = ["--only_fp8"]
 
     if not skip_gpt:
         prepare_model_tests(model_name="gpt",
@@ -178,8 +185,14 @@ def prepare_all_model_tests(python_exe: str,
                             python_exe=python_exe,
                             root_dir=root_dir,
                             resources_dir=resources_dir,
-                            model_cache_arg=model_cache_arg,
-                            only_fp8_arg=only_fp8_arg)
+                            model_cache_arg=model_cache_arg)
+        if run_fp8:
+            prepare_model_tests(model_name="gptj",
+                                python_exe=python_exe,
+                                root_dir=root_dir,
+                                resources_dir=resources_dir,
+                                model_cache_arg=model_cache_arg,
+                                only_fp8_arg=only_fp8_arg)
     else:
         _log.info("Skipping GPT-J tests")
 
@@ -232,22 +245,20 @@ def prepare_model_tests(model_name: str,
     ] + model_cache_arg + only_fp8_arg + only_multi_gpu_arg
     run_command(build_engines, cwd=root_dir, env=model_env)
 
+    model_env["PYTHONPATH"] = "examples"
     generate_expected_output = [
         python_exe,
         str(scripts_dir / f"generate_expected_{model_name}_output.py")
     ] + only_fp8_arg + only_multi_gpu_arg
     if only_multi_gpu_arg:
         generate_expected_output = [
-            "mpirun",
-            "-n",
-            "4",
-            "--allow-run-as-root",
+            "mpirun", "-n", "4", "--allow-run-as-root", "--timeout", "600"
         ] + generate_expected_output
     run_command(generate_expected_output, cwd=root_dir, env=model_env)
 
 
 def run_google_tests(build_dir: _pl.Path, skip_gpt, skip_gptj, skip_llama,
-                     skip_chatglm, only_fp8):
+                     skip_chatglm, run_fp8):
     make_google_tests = [
         "cmake", "--build", ".", "--config", "Release", "-j", "--target",
         "google-tests"
@@ -267,9 +278,7 @@ def run_google_tests(build_dir: _pl.Path, skip_gpt, skip_gptj, skip_llama,
         excluded_tests.append(".*Llama.*")
     if skip_chatglm:
         excluded_tests.append(".*ChatGlm.*")
-    if only_fp8:
-        ctest.extend(["-R", ".*FP8.*"])
-    else:
+    if not run_fp8:
         excluded_tests.append(".*FP8.*")
     if excluded_tests:
         ctest.extend(["-E", "|".join(excluded_tests)])
@@ -353,6 +362,9 @@ if __name__ == "__main__":
     parser = _arg.ArgumentParser()
 
     parser.add_argument("--cuda_architectures", "-a")
+    parser.add_argument("--use_ccache",
+                        action="store_true",
+                        help="Use ccache in cmake building stage")
     parser.add_argument("--build_dir",
                         type=str,
                         help="Directory where cpp sources are built")
@@ -390,9 +402,9 @@ if __name__ == "__main__":
                         action="store_true",
                         help="Skip the tests for ChatGLM")
     parser.add_argument(
-        "--only_fp8",
+        "--run_fp8",
         action="store_true",
-        help="Run only FP8 tests. Implemented for H100 runners.")
+        help="Additionally run FP8 tests. Implemented for H100 runners.")
     parser.add_argument(
         "--only_multi_gpu",
         action="store_true",

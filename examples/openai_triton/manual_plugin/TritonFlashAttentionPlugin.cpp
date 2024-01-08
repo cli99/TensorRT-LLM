@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -112,7 +112,7 @@ size_t TritonFlashAttentionPlugin::getWorkspaceSize(const nvinfer1::PluginTensor
     size_t workspaces[numBuffers];
     workspaces[0] = sizeof(float) * batchSize * mNumHeads * seqLen;
     workspaces[1] = sizeof(float) * batchSize * mNumHeads * seqLen;
-    return tensorrt_llm::plugins::calculateTotalWorkspaceSize(workspaces, numBuffers);
+    return tensorrt_llm::common::calculateTotalWorkspaceSize(workspaces, numBuffers);
 }
 
 template <typename T>
@@ -131,7 +131,7 @@ int TritonFlashAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* in
 
     const size_t bufSize = sizeof(float) * batchSize * mNumHeads * seqLen;
     float* L = reinterpret_cast<float*>(workspace);
-    float* M = reinterpret_cast<float*>(tensorrt_llm::plugins::nextWorkspacePtr(reinterpret_cast<int8_t*>(L), bufSize));
+    float* M = reinterpret_cast<float*>(tensorrt_llm::common::nextWorkspacePtr(reinterpret_cast<int8_t*>(L), bufSize));
 
     const T* Q = reinterpret_cast<const T*>(inputs[0]);
     const T* K = reinterpret_cast<const T*>(inputs[1]);

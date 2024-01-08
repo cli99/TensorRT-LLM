@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -130,13 +130,13 @@ void TllmRuntime::setInputTensors(SizeType contextIndex, TensorMap const& tensor
             // WAR: TRT does not support mixed FP8 and FP16 input, so engine expects FP16 tensors.
             TLLM_CHECK_WITH_INFO(tensorDtype == engineDtype
                     || (tensorDtype == nvinfer1::DataType::kFP8 && engineDtype == nvinfer1::DataType::kHALF),
-                tc::fmtstr("%s: expected type %d, provided type %d", name, static_cast<std::int32_t>(engineDtype),
-                    static_cast<std::int32_t>(tensorDtype)));
+                "%s: expected type %d, provided type %d", name, static_cast<std::int32_t>(engineDtype),
+                static_cast<std::int32_t>(tensorDtype));
 
             auto const shapeExpected = mEngine->getTensorShape(name);
             auto const shapeProvided = tensor->getShape();
-            TLLM_CHECK_WITH_INFO(shapeExpected.nbDims == shapeProvided.nbDims,
-                tc::fmtstr("%s: expected %d dims, provided %d dims", name, shapeExpected.nbDims, shapeProvided.nbDims));
+            TLLM_CHECK_WITH_INFO(shapeExpected.nbDims == shapeProvided.nbDims, "%s: expected %d dims, provided %d dims",
+                name, shapeExpected.nbDims, shapeProvided.nbDims);
             for (SizeType j = 0; j < shapeExpected.nbDims; ++j)
             {
                 auto const dimExpected = shapeExpected.d[j];
@@ -147,7 +147,9 @@ void TllmRuntime::setInputTensors(SizeType contextIndex, TensorMap const& tensor
                         "%s: expected dim[%d] = %d, provided dim[%d] = %d", name, j, dimExpected, j, dimProvided);
                 }
             }
-            TLLM_CHECK_WITH_INFO(context.setInputShape(name, shapeProvided), name);
+            TLLM_CHECK_WITH_INFO(context.setInputShape(name, shapeProvided),
+                "Tensor '%s' has invalid shape %s, expected %s", name, ITensor::toString(shapeProvided).c_str(),
+                ITensor::toString(shapeExpected).c_str());
             auto* const data = tensor->data();
             if (data)
             {
@@ -207,8 +209,8 @@ void TllmRuntime::setOutputTensors(SizeType contextIndex, TensorMap& tensorMap)
                 // WAR: TRT does not support mixed FP8 and FP16 input, so engine expects FP16 tensors.
                 TLLM_CHECK_WITH_INFO(tensorDtype == engineDtype
                         || (tensorDtype == nvinfer1::DataType::kFP8 && engineDtype == nvinfer1::DataType::kHALF),
-                    tc::fmtstr("%s: expected type %d, provided type %d", name, static_cast<std::int32_t>(engineDtype),
-                        static_cast<std::int32_t>(tensorDtype)));
+                    "%s: expected type %d, provided type %d", name, static_cast<std::int32_t>(engineDtype),
+                    static_cast<std::int32_t>(tensorDtype));
 
                 tensor->reshape(dims);
                 context.setTensorAddress(name, tensor->data());

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -44,7 +44,8 @@ protected:
     {
         size_t workspaceSize;
         tk::invokeTopKSampling<T>(nullptr, workspaceSize, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-            nullptr, this->mMaxTopK, 1.0f, params.vocabSize, nullptr, this->mStream->get(), params.batchSize, nullptr);
+            nullptr, this->mMaxTopK, 1.0f, params.vocabSize, nullptr, this->mStream->get(), params.batchSize, nullptr,
+            true);
         return workspaceSize;
     }
 
@@ -58,13 +59,17 @@ protected:
             // provided. It's because the sampling layer already
             // preprocesses log_prob_buf when those are provided.
             bufferCast<T>(*this->mProbsDevice), bufferCast<int*>(*this->mIdsPtrHost),
-            bufferCast<int32_t>(*this->mSeqLengthsDevice), bufferCast<bool>(*this->mFinishedDevice),
-            bufferCast<bool>(*this->mFinishedDevice), bufferCast<float>(*this->mCumLogProbsDevice),
-            bufferCast<float>(*this->mOutputLogProbsDevice), this->mCurandStatesDevice, this->mMaxTopK,
+            bufferCast<int32_t>(*this->mSeqLengthsDevice),
+            reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
+                bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice)),
+            reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
+                bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice)),
+            bufferCast<float>(*this->mCumLogProbsDevice), bufferCast<float>(*this->mOutputLogProbsDevice),
+            this->mCurandStatesDevice, this->mMaxTopK,
             hasDiffRuntimeArgs ? bufferCast<int32_t>(*this->mTopKsDevice) : nullptr, params.topP,
             hasDiffRuntimeArgs ? bufferCast<float>(*this->mTopPsDevice) : nullptr, params.vocabSize,
             bufferCast<int32_t>(*this->mEndIdsDevice), this->mStream->get(), params.batchSize,
-            bufferCast<bool>(*this->mSkipDecodeDevice));
+            bufferCast<bool>(*this->mSkipDecodeDevice), params.normalizeLogProbs);
     }
 };
 

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -75,9 +75,13 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
                 name='host_past_key_value_lengths',
                 shape=shape_dict['host_past_key_value_lengths'],
                 dtype=tensorrt_llm.str_dtype_to_trt('int32'))
-            host_max_kv_cache_lengths_tensor = Tensor(
-                name='host_max_kv_cache_lengths',
-                shape=shape_dict['host_max_kv_cache_lengths'],
+            host_max_attention_window_sizes_tensor = Tensor(
+                name='host_max_attention_window_sizes',
+                shape=shape_dict['host_max_attention_window_sizes'],
+                dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+            host_sink_token_length_tensor = Tensor(
+                name='host_sink_token_length',
+                shape=shape_dict['host_sink_token_length'],
                 dtype=tensorrt_llm.str_dtype_to_trt('int32'))
             context_lengths_tensor = Tensor(
                 name='context_lengths',
@@ -122,11 +126,13 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
             else:
                 position_embedding_type = PositionEmbeddingType.learned_absolute
             outputs = tensorrt_llm.functional.gpt_attention(
-                tensor=qkv,
+                qkv=qkv,
                 past_key_value=past_key_value_tensor,
                 sequence_length=sequence_length_tensor,
                 host_past_key_value_lengths=host_past_key_value_lengths_tensor,
-                host_max_kv_cache_lengths=host_max_kv_cache_lengths_tensor,
+                host_max_attention_window_sizes=
+                host_max_attention_window_sizes_tensor,
+                host_sink_token_length=host_sink_token_length_tensor,
                 context_lengths=context_lengths_tensor,
                 cache_indirection=cache_indirection_tensor,
                 host_request_types=host_request_types_tensor,
@@ -177,7 +183,8 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
         'input': (batch_size, in_len, hidden_size),
         'output': (batch_size, in_len, hidden_size),
         'host_past_key_value_lengths': (batch_size, ),
-        'host_max_kv_cache_lengths': (1, )
+        'host_max_attention_window_sizes': (1, ),
+        'host_sink_token_length': (1, )
     }
 
     weight = torch.randn(shape_dict['weight'],
@@ -417,7 +424,7 @@ class GPTAttentionPluginRemovePaddingRewritePass(PatternRewriter):
 
         flayer = FLayerInfoMemo.instance().get(layer.name)
         assert flayer
-        tensor_input: Tensor = flayer.get_input('tensor')
+        tensor_input: Tensor = flayer.get_input('qkv')
         if tensor_input.shape[0] == 1:  # already on remove-padding mode
             return False
 
@@ -434,11 +441,11 @@ class GPTAttentionPluginRemovePaddingRewritePass(PatternRewriter):
         with net_guard(layer.network):
             # Step 1: create new inputs and repalce the original arglist
             input = Tensor(
-                name='tensor',
+                name='qkv',
                 dtype=trt.float16,
                 shape=(1, batch_size * in_len, hidden_size),
             )
-            new_inputs['tensor'] = input
+            new_inputs['qkv'] = input
 
             # Step 2: create a new plugin instance
             new_outs = gpt_attention(**new_inputs)

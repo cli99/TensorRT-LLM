@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -131,7 +131,6 @@ class TestGPTJ(unittest.TestCase):
                 network.plugin_config.set_gpt_attention_plugin(dtype)
             if use_ln_gemm_plugin:
                 network.plugin_config.set_gemm_plugin(dtype)
-                network.plugin_config.set_layernorm_plugin(dtype)
             if enable_remove_input_padding:
                 network.plugin_config.enable_remove_input_padding()
             network.plugin_config.set_context_fmha(context_fmha_flag)
@@ -228,7 +227,8 @@ class TestGPTJ(unittest.TestCase):
                        last_token_ids,
                        cache_indirection,
                        host_past_key_value_lengths,
-                       host_max_kv_cache_lengths,
+                       host_max_attention_window_sizes,
+                       host_sink_token_length,
                        sequence_length,
                        host_context_lengths=None):
 
@@ -241,11 +241,12 @@ class TestGPTJ(unittest.TestCase):
                 'cache_indirection': cache_indirection,
                 'host_past_key_value_lengths': host_past_key_value_lengths,
                 'sequence_length': sequence_length,
+                'host_sink_token_length': host_sink_token_length,
             }
             for i in range(gpt_config.n_layer):
                 ctx_buffer[f'past_key_value_{i}'] = key_value_cache_buffers[i]
                 ctx_buffer[
-                    f'host_max_kv_cache_length_{i}'] = host_max_kv_cache_lengths
+                    f'host_max_attention_window_size_{i}'] = host_max_attention_window_sizes
                 ctx_buffer[f'present_key_value_{i}'] = key_value_cache_buffers[
                     i]
 
@@ -310,9 +311,8 @@ class TestGPTJ(unittest.TestCase):
             ctx_last_token_ids = ctx_context_lengths.clone()
 
             if enable_remove_input_padding:
-                ctx_ids = ctx_ids.view([1, batch_size * seq_len])
-                ctx_position_ids = ctx_position_ids.view(
-                    [1, batch_size * seq_len])
+                ctx_ids = ctx_ids.view([batch_size * seq_len])
+                ctx_position_ids = ctx_position_ids.view([batch_size * seq_len])
                 ctx_last_token_ids = torch.cumsum(ctx_last_token_ids,
                                                   dim=0).int()
 
@@ -320,8 +320,9 @@ class TestGPTJ(unittest.TestCase):
                                               dtype=torch.int32).cpu()
             host_past_key_value_lengths = torch.tensor([0] * batch_size,
                                                        dtype=torch.int32)
-            host_max_kv_cache_lengths = torch.tensor([total_seq_len],
-                                                     dtype=torch.int32)
+            host_max_attention_window_sizes = torch.tensor([total_seq_len],
+                                                           dtype=torch.int32)
+            host_sink_token_length = torch.tensor([0], dtype=torch.int32)
 
             host_context_lengths = ctx_context_lengths.cpu(
             ) if enable_remove_input_padding else None
@@ -334,7 +335,8 @@ class TestGPTJ(unittest.TestCase):
                 last_token_ids=ctx_last_token_ids,
                 cache_indirection=cache_indirections[0],
                 host_past_key_value_lengths=host_past_key_value_lengths,
-                host_max_kv_cache_lengths=host_max_kv_cache_lengths,
+                host_max_attention_window_sizes=host_max_attention_window_sizes,
+                host_sink_token_length=host_sink_token_length,
                 sequence_length=sequence_length_buffer,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types)
@@ -383,14 +385,14 @@ class TestGPTJ(unittest.TestCase):
                 hf_outputs = hf_gpt.forward(
                     step1_id,
                     past_key_values=hf_outputs.past_key_values,
-                    position_ids=gen_position_ids,
+                    position_ids=gen_position_ids.to(torch.int64),
                     use_cache=True)
             torch.cuda.synchronize()
             ref = hf_outputs.logits[:, -1, :]
 
             if enable_remove_input_padding:
-                step1_id = step1_id.view([1, batch_size])
-                gen_position_ids = gen_position_ids.view([1, batch_size])
+                step1_id = step1_id.view([batch_size])
+                gen_position_ids = gen_position_ids.view([batch_size])
                 gen_last_token_ids = torch.ones_like(
                     gen_context_lengths).int().cuda()
                 gen_last_token_ids = torch.cumsum(gen_last_token_ids,
@@ -399,8 +401,10 @@ class TestGPTJ(unittest.TestCase):
             host_past_key_value_lengths = torch.tensor([seq_len] * batch_size,
                                                        dtype=torch.int32)
 
-            host_max_kv_cache_lengths = torch.tensor([total_seq_len],
-                                                     dtype=torch.int32)
+            host_max_attention_window_sizes = torch.tensor([total_seq_len],
+                                                           dtype=torch.int32)
+
+            host_sink_token_length = torch.tensor([0], dtype=torch.int32)
 
             host_request_types = torch.tensor([1] * batch_size,
                                               dtype=torch.int32).cpu()
@@ -419,7 +423,8 @@ class TestGPTJ(unittest.TestCase):
                 last_token_ids=gen_last_token_ids,
                 cache_indirection=cache_indirections[1],
                 host_past_key_value_lengths=host_past_key_value_lengths,
-                host_max_kv_cache_lengths=host_max_kv_cache_lengths,
+                host_max_attention_window_sizes=host_max_attention_window_sizes,
+                host_sink_token_length=host_sink_token_length,
                 sequence_length=sequence_length_buffer,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types)

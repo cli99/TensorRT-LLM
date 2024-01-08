@@ -9,7 +9,7 @@ multiple GPUs or multiple nodes with multiple GPUs.
 
 Please follow the [`installation document`](../../docs/source/installation.md) to build TensorRT-LLM.
 
-Note that the benchmarking source code for C++ runtime is not built by default, you can use the argument `--benchmarks` in [`build_wheel.py`](../../scripts/build_wheel.py) to build that.
+Note that the benchmarking source code for C++ runtime is not built by default, you can use the argument `--benchmarks` in [`build_wheel.py`](source:scripts/build_wheel.py) to build the corresponding executable.
 
 Windows users: Follow the
 [`Windows installation document`](../../windows/README.md)
@@ -18,9 +18,13 @@ instead, and be sure to set DLL paths as specified in
 
 ### 2. Launch C++ benchmarking (Fixed BatchSize/InputLen/OutputLen)
 
+#### Prepare TensorRT-LLM engine(s)
+
 Before you launch C++ benchmarking, please make sure that you have already built engine(s) using TensorRT-LLM API, C++ benchmarking code cannot generate engine(s) for you.
 
-You can reuse the engine built by benchmarking code for Python Runtime, please see that [`document`](../python/README.md).
+You can use the [`build.py`](source:benchmarks/python/build.py) script to build the engine(s). Alternatively, if you have already benchmarked Python Runtime, you can reuse the engine(s) built previously, please see that [`document`](../python/README.md).
+
+####  Launch benchmarking
 
 For detailed usage, you can do the following
 ```

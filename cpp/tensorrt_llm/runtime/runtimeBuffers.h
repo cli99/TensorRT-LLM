@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -49,11 +49,13 @@ public:
         GenerationConfig() = default;
 
         explicit GenerationConfig(SizeType batchSize, SizeType beamWidth, SizeType maxInputLength,
-            SizeType maxKvCacheLength, SizeType maxSeqLength, SizeType inputLengthSum = SizeType(0))
+            SizeType maxAttentionWindow, SizeType sinkTokenLength, SizeType maxSeqLength,
+            SizeType inputLengthSum = SizeType(0))
             : batchSize{batchSize}
             , beamWidth{beamWidth}
             , maxInputLength{maxInputLength}
-            , maxKvCacheLength{maxKvCacheLength}
+            , maxAttentionWindow{maxAttentionWindow}
+            , sinkTokenLength{sinkTokenLength}
             , maxSeqLength{maxSeqLength}
             , inputLengthSum{inputLengthSum}
         {
@@ -62,12 +64,13 @@ public:
         SizeType batchSize{};
         SizeType beamWidth{};
         SizeType maxInputLength{};
-        SizeType maxKvCacheLength{};
+        SizeType maxAttentionWindow{};
+        SizeType sinkTokenLength{};
         SizeType maxSeqLength{};
         SizeType inputLengthSum{}; // Initialized only if inputPacked is set to true in fromInput.
 
         static GenerationConfig fromInput(ITensor const& inputIds, ITensor const& inputLengths, bool inputPacked,
-            SizeType beamWidth, SizeType maxKvCacheLength, SizeType maxSequenceLength);
+            SizeType beamWidth, SizeType maxAttentionWindow, SizeType sinkTokenLength, SizeType maxSequenceLength);
     };
 
 public:
@@ -86,13 +89,15 @@ public:
     TensorPtr attentionMask;       // without attention plugin
     TensorPtr positionIds;
     TensorPtr lastTokenIds;
-    TensorPtr requestTypes; // with attention plugin. Host tensor
+    TensorPtr requestTypes;        // with attention plugin. Host tensor
+    TensorPtr allGenerationLogits; // pre-allocate a buffer to save all generation logits, device tensor
 
     std::vector<TensorPtr> presentKeysVals;
-    std::vector<TensorPtr> presentKeysValsAlt; // without attention plugin
-    std::vector<TensorPtr> maxKvCacheLengths;  // with attention plugin, host tensor
-    TensorPtr kvCacheBlockPointersHost;        // [numLayers, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
-    TensorPtr kvCacheBlockPointersDevice;      // [numLayers, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
+    std::vector<TensorPtr> presentKeysValsAlt;  // without attention plugin
+    std::vector<TensorPtr> maxAttentionWindows; // with attention plugin, host tensor
+    TensorPtr sinkTokenLengths;                 // with attention plugin, host tensor
+    TensorPtr kvCacheBlockPointersHost;         // [numLayers, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
+    TensorPtr kvCacheBlockPointersDevice;       // [numLayers, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
 
     // References to tmp buffers
     TensorPtr newTokens;
@@ -117,6 +122,14 @@ public:
     PromptTuningParams promptTuningParams;
     TensorPtr promptTuningTasksHost; // Tensor to hold tasks on host
 
+    // Context and generation logits buffer
+    TensorPtr cacheContextLogits;
+    TensorPtr cacheContextLogitsHost;
+    TensorPtr cacheGenerationLogits;
+    TensorPtr cacheGenerationLogitsHost;
+    TensorPtr cacheGenerationFragmentPointerDevice;
+    TensorPtr cacheGenerationFragmentPointerHost;
+
     bool allocated{false};
 
 public:
@@ -126,7 +139,7 @@ public:
     void create(TllmRuntime& runtime, GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void initFromInput(ITensor const& inputIds, TensorPtr const& inputLengths, bool inputPacked, SizeType beamWidth,
-        SizeType maxKvCacheLength, SizeType maxSequenceLength, BufferManager& manager);
+        SizeType maxAttentionWindow, SizeType sinkTokenLength, SizeType maxSequenceLength, BufferManager& manager);
 
     //! \brief Reshape buffers based on current GenerationConfig
     void reshape(GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
@@ -138,9 +151,6 @@ public:
 
     void postContextStep(std::vector<RuntimeBuffers> const& contextBuffers, BufferManager& manager,
         GptModelConfig const& modelConfig, WorldConfig const& worldConfig);
-
-    void postEachGenerationStep(BufferManager& manager, TensorPtr outputGenerationLogits, SizeType step,
-        SizeType firstBatchSlotIdx, SizeType microBatchSize, SizeType beamWidth, WorldConfig const& worldConfig);
 
     void prepareContextStep(TensorPtr const& inputIds, TokenIdType padId, BufferManager& manager,
         KvCacheManager const* kvCacheManager, SizeType firstBatchSlotIdx, GptModelConfig const& modelConfig,

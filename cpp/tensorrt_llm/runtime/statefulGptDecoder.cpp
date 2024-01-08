@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,9 +20,11 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
 namespace tc = tensorrt_llm::common;
+namespace tk = tensorrt_llm::kernels;
 using namespace tensorrt_llm::runtime;
 
 using TensorPtr = ITensor::SharedPtr;
@@ -41,7 +43,7 @@ StatefulGptDecoder::StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabS
     auto& dInput = mDecodingInput;
     auto dummyLogits = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     auto endIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-    dInput = std::make_unique<DecodingInput>(0, 0, 0, std::move(dummyLogits), std::move(endIds));
+    dInput = std::make_unique<DecodingInput>(0, 0, 0, 0, std::move(dummyLogits), std::move(endIds));
 
     dInput->sequenceLimitLength = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
     dInput->lengths = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
@@ -52,7 +54,8 @@ StatefulGptDecoder::StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabS
 
     dOutput->newTokens = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
     dOutput->parentIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-    dOutput->finished = mBufferManager.emptyTensor(MemoryType::kGPU, TRTDataType<bool>::value);
+    dOutput->finished
+        = mBufferManager.emptyTensor(MemoryType::kGPU, TRTDataType<tk::FinishedState::UnderlyingType>::value);
     dOutput->finishedSum = BufferManager::pinned(ITensor::makeShape({1}), nvSizeType);
     dOutput->lengths = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
     dOutput->cumLogProbs = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
@@ -61,19 +64,19 @@ StatefulGptDecoder::StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabS
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-void StatefulGptDecoder::setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxKvCacheLength,
-    SizeType maxSequenceLength, SizeType maxTokensPerStep, nvinfer1::DataType dtype)
+void StatefulGptDecoder::setup(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxAttentionWindow,
+    SizeType sinkTokenLength, SizeType maxSequenceLength, SizeType maxTokensPerStep, nvinfer1::DataType dtype)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(maxTokensPerStep == 1);
     mDecoder = IGptDecoder::create(dtype, mVocabSize, mVocabSizePadded, mStream);
 
-    reshapeBuffers(maxBatchSize, maxBeamWidth, maxKvCacheLength, maxSequenceLength);
+    reshapeBuffers(maxBatchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSequenceLength);
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-void StatefulGptDecoder::reshapeBuffers(
-    SizeType batchSize, SizeType beamWidth, SizeType maxKvCacheLength, SizeType maxSequenceLength)
+void StatefulGptDecoder::reshapeBuffers(SizeType batchSize, SizeType beamWidth, SizeType maxAttentionWindow,
+    SizeType sinkTokenLength, SizeType maxSequenceLength)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(batchSize > 0);
@@ -81,7 +84,8 @@ void StatefulGptDecoder::reshapeBuffers(
     TLLM_CHECK(maxSequenceLength > 0);
 
     mMaxSequenceLength = maxSequenceLength;
-    mMaxKvCacheLength = maxKvCacheLength;
+    mMaxAttentionWindow = maxAttentionWindow;
+    mSinkTokenLength = sinkTokenLength;
 
     auto const batchSizeShape = ITensor::makeShape({batchSize});
     auto const batchSizeXbeamWidth = ITensor::makeShape({batchSize, beamWidth});
@@ -134,7 +138,7 @@ void StatefulGptDecoder::newBatch(
     auto const batchSize = inputLengthsShape.d[0];
     auto const beamWidth = samplingConfig.beamWidth;
 
-    reshapeBuffers(batchSize, beamWidth, mMaxKvCacheLength, mMaxSequenceLength);
+    reshapeBuffers(batchSize, beamWidth, mMaxAttentionWindow, mSinkTokenLength, mMaxSequenceLength);
     mDecoder->setup(samplingConfig, batchSize, mMaxSequenceLength);
 
     // sanity checks, should always be true after reshape
@@ -164,7 +168,8 @@ void StatefulGptDecoder::newBatch(
     // inputs
     auto& dInput = *mDecodingInput;
     dInput.maxLength = maxInputLength;
-    dInput.maxKvCacheLength = mMaxKvCacheLength;
+    dInput.maxAttentionWindow = mMaxAttentionWindow;
+    dInput.sinkTokenLength = mSinkTokenLength;
     dInput.batchSize = batchSize;
     kernels::invokeFill(const_cast<ITensor&>(*dInput.endIds), endId, *stream);
     dInput.embeddingBias = inputs.embeddingBias;

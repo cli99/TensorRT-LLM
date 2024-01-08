@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -58,15 +58,19 @@ def _quantize_model(model: torch.nn.Module,
         f'Got unsupported AMMO quantization format, {qformat} '
     if qformat == "fp8":
         quant_cfg = atq.FP8_DEFAULT_CFG
-        if quant_cfg_dict:
-            for name, cfg in quant_cfg_dict.items():
-                quant_cfg['quant_cfg'][name] = cfg
     elif qformat == "int8_sq":
         quant_cfg = atq.INT8_SMOOTHQUANT_CFG
     elif qformat == "int4_awq":
         quant_cfg = atq.INT4_AWQ_CFG
+        # AMMO 0.5.0 disables lm_head quantization by default, remove the filter
+        if "*lm_head*" in quant_cfg["quant_cfg"]:
+            del quant_cfg["quant_cfg"]["*lm_head*"]
     else:
         raise ValueError(f"Unsupported quantization format: {qformat}")
+
+    if quant_cfg_dict:
+        for name, cfg in quant_cfg_dict.items():
+            quant_cfg['quant_cfg'][name] = cfg
 
     def calibrate_loop():
         """Adjusts weights and scaling factors based on selected algorithms."""
@@ -82,42 +86,50 @@ def _quantize_model(model: torch.nn.Module,
     return model
 
 
-def quantize_and_export(model: torch.nn.Module,
-                        qformat: Literal['fp8', 'int8_sq', 'int4_awq'],
-                        calib_dataloader: DataLoader,
-                        export_path: Optional[Union[str, Path]] = None,
-                        tensor_parallel_size: int = 1) -> torch.nn.Module:
+def quantize_and_export(
+        model: torch.nn.Module,
+        qformat: Literal['fp8', 'int8_sq', 'int4_awq'],
+        calib_dataloader: DataLoader,
+        export_path: Optional[Union[str, Path]] = None,
+        tensor_parallel_size: int = 1,
+        quant_cfg_dict: Optional[Dict] = None) -> torch.nn.Module:
 
     model_cls_name = type(model).__name__
-    if "Llama" in model_cls_name:
-        model_type = "llama"
-    elif "GPTJ" in model_cls_name:
-        model_type = "gptj"
-    elif "GPT2" in model_cls_name:
-        model_type = "gpt2"
-    elif "Falcon" in model_cls_name or "RW" in model_cls_name:
-        model_type = "falcon"
-    elif "ChatGLM" in model_cls_name:
-        model_type = "chatglm"
-    elif "MPT" in model_cls_name:
-        model_type = "mpt"
+    model_lookup = {
+        ("llama", "mistral"): "llama",
+        ("gptj", ): "gptj",
+        ("falcon", "rw"): "falcon",
+        ("baichuan", ): "baichuan",
+        ("mpt", ): "mpt",
+        ("gpt2", ): "gpt2",
+        ("chatglm", ): "chatglm",
+        ("qwen", ): "qwen",
+    }
+    for templates, model_type_target in model_lookup.items():
+        if any(t in model_cls_name.lower() for t in templates):
+            model_type = model_type_target
+            break
     else:
         raise NotImplementedError(
             f"Deploying quantized model {model_cls_name} is not supported")
 
     model = _quantize_model(model,
                             qformat=qformat,
-                            calib_dataloader=calib_dataloader)
+                            calib_dataloader=calib_dataloader,
+                            quant_cfg_dict=quant_cfg_dict)
 
     if export_path:
         with torch.inference_mode():
-            export_model_config(
-                model,
-                model_type,
-                torch.float16,
-                quantization=qformat,
-                export_dir=export_path,
-                inference_tensor_parallel=tensor_parallel_size,
-            )
+            if qformat == "int4_awq" and model_type == "qwen" or \
+                model_type == "chatglm":
+                torch.save(model.state_dict(), export_path)
+            else:
+                export_model_config(
+                    model,
+                    model_type,
+                    torch.float16,
+                    export_dir=export_path,
+                    inference_tensor_parallel=tensor_parallel_size,
+                )
         logger.info(f"Quantized model exported to :{export_path}")
     return model

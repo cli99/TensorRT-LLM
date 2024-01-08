@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -48,14 +48,14 @@ public:
     using BeamTokens = std::vector<VecTokens>;
     using TensorPtr = TTensor;
 
-    GenericLlmRequest(RequestIdType requestId, SizeType maxNewTokens,
-        std::shared_ptr<std::vector<TokenIdType>> inputTokens, runtime::SamplingConfig samplingConfig, bool isStreaming,
-        std::optional<SizeType> endId = std::nullopt, std::optional<SizeType> padId = std::nullopt,
-        std::optional<TensorPtr> embeddingBias = std::nullopt, std::optional<TensorPtr> badWordsList = std::nullopt,
-        std::optional<TensorPtr> stopWordsList = std::nullopt,
+    GenericLlmRequest(RequestIdType requestId, SizeType maxNewTokens, std::shared_ptr<VecTokens> inputTokens,
+        runtime::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType> endId = std::nullopt,
+        std::optional<SizeType> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
+        std::optional<TensorPtr> badWordsList = std::nullopt, std::optional<TensorPtr> stopWordsList = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType> promptVocabSize = std::nullopt, bool returnLogProbs = false,
-        std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt)
+        std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt,
+        std::optional<TensorPtr> draftLogits = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -64,7 +64,7 @@ public:
         , mIsStreaming(isStreaming)
         , mEndId(endId)
         , mPadId(padId)
-        , mBatchSlot(-1)
+        , mSeqSlot(-1)
         , mOrigPromptLen(inputTokens->size())
         , mEmbeddingBias(embeddingBias)
         , mBadWordsList(badWordsList)
@@ -75,6 +75,7 @@ public:
         , mLogProbs(samplingConfig.beamWidth)
         , mCumLogProbs(samplingConfig.beamWidth)
         , mDraftTokens(draftTokens.value_or(std::make_shared<VecTokens>()))
+        , mDraftLogits(draftLogits)
     {
         mMaxSentTokenPos = mPromptLen - 1;
         // Scatter the input tokens to other beam
@@ -86,6 +87,13 @@ public:
             std::string errStr
                 = "Prompt embedding table and prompt vocab size tensors must both be provided for requests with prompt "
                   "tuning enabled.";
+            TLLM_LOG_ERROR(errStr);
+            throw std::runtime_error(errStr);
+        }
+
+        if (draftLogits.has_value() && !draftTokens.has_value())
+        {
+            std::string errStr = "Draft tokens must be specified when draft logits are given.";
             TLLM_LOG_ERROR(errStr);
             throw std::runtime_error(errStr);
         }
@@ -123,16 +131,30 @@ public:
     /// @brief Get the tokens at a given beam index
     /// @param beam The beam index
     /// @return A vector of tokens for this beam index, includes the prompt
-    std::vector<TokenIdType> const& getTokens(SizeType beam) const
+    VecTokens const& getTokens(SizeType beam) const
     {
         return mTokens.at(beam);
     }
 
+    /// @brief Get all tokens (input+output) for all beams
+    /// @return A vector of vector of tokens.
+    BeamTokens const& getTokens() const
+    {
+        return mTokens;
+    }
+
     /// @brief Get the draft tokens
     /// @return shared_ptr to vector of draft tokens
-    std::shared_ptr<std::vector<TokenIdType>> const& getDraftTokens() const
+    std::shared_ptr<VecTokens> const& getDraftTokens() const
     {
         return mDraftTokens;
+    }
+
+    /// @brief Get the logits for the draft tokens
+    /// @return Tensor of draft logits
+    std::optional<TensorPtr> getDraftLogits() const
+    {
+        return mDraftLogits;
     }
 
     /// @brief Returns true if request has draft tokens
@@ -160,9 +182,9 @@ public:
     /// @brief Add new generated tokens to the vector of tokens
     /// @param beamTokens A vector containing the tokens to add for each beam index
     ///                   beamTokens is expected to be of size beamWidth
-    void addNewTokens(const std::vector<TokenIdType>& beamTokens)
+    void addNewTokens(VecTokens const& beamTokens)
     {
-        assert(mSamplingConfig.beamWidth == beamTokens.size());
+        assert(static_cast<size_t>(mSamplingConfig.beamWidth) == beamTokens.size());
         for (std::size_t beam = 0; beam < beamTokens.size(); ++beam)
         {
             const auto outputId = beamTokens[beam];
@@ -174,7 +196,7 @@ public:
     /// @param generatedBeamTokens The generated tokens for all beams (vector of vector of tokens)
     void setGeneratedTokens(const BeamTokens& generatedBeamTokens)
     {
-        assert(generatedBeamTokens.size() == mSamplingConfig.beamWidth);
+        assert(generatedBeamTokens.size() == static_cast<size_t>(mSamplingConfig.beamWidth));
         for (std::size_t beam = 0; beam < generatedBeamTokens.size(); ++beam)
         {
             auto& beamTokens = mTokens[beam];
@@ -220,7 +242,7 @@ public:
             mPromptLen = newPromptLen;
         }
         mState = REQUEST_STATE_CONTEXT_INIT;
-        mBatchSlot = -1;
+        mSeqSlot = -1;
     }
 
     /// @brief Get the maximum position of the tokens returned to the client. Use to ensure we don't return to
@@ -305,6 +327,51 @@ public:
         mDraftTokens = draftTokens;
     }
 
+    void setDraftLogits(const std::optional<TensorPtr>& draftLogits)
+    {
+        mDraftLogits = draftLogits;
+    }
+
+    TensorPtr const& getContextLogitsHost() const
+    {
+        return mContextLogitsHost;
+    }
+
+    void setContextLogitsHost(TensorPtr contextLogitsHost)
+    {
+        mContextLogitsHost = std::move(contextLogitsHost);
+    }
+
+    TensorPtr const& getGenerationLogitsHost() const
+    {
+        return mGenerationLogitsHost;
+    }
+
+    void setGenerationLogitsHost(TensorPtr generationLogitsHost)
+    {
+        mGenerationLogitsHost = std::move(generationLogitsHost);
+    }
+
+    std::vector<TensorPtr> const& getGenerationLogitsFragments() const
+    {
+        return mGenerationLogitsFragments;
+    }
+
+    void addGenerationFragments(TensorPtr& genLogits)
+    {
+        mGenerationLogitsFragments.push_back(genLogits);
+    }
+
+    SizeType getGenerationLogitsFragmentsSize()
+    {
+        return mGenerationLogitsFragments.size();
+    }
+
+    void clearGenerationLogitsFragments()
+    {
+        mGenerationLogitsFragments.clear();
+    }
+
     RequestIdType mRequestId;
     SizeType mPromptLen;
     SizeType mMaxNewTokens;
@@ -314,7 +381,7 @@ public:
     bool mIsStreaming;
     std::optional<SizeType> mEndId;
     std::optional<SizeType> mPadId;
-    SizeType mBatchSlot;
+    SizeType mSeqSlot;
 
 protected:
     SizeType mOrigPromptLen;
@@ -333,6 +400,14 @@ protected:
     std::vector<VecLogProbs> mLogProbs; // [beamSize, seqLen]
     VecLogProbs mCumLogProbs;           // [beamSize]
     std::shared_ptr<VecTokens> mDraftTokens;
+    std::optional<TensorPtr> mDraftLogits;
+
+    // Save logits
+    TensorPtr mContextLogits;    // [mPromptLen, vocab_size_padded]
+    TensorPtr mContextLogitsHost;
+    TensorPtr mGenerationLogits; // [beam_size, mMaxNewTokens, vocab_size_padded]
+    TensorPtr mGenerationLogitsHost;
+    std::vector<TensorPtr> mGenerationLogitsFragments;
 };
 
 class LlmRequest : public GenericLlmRequest<runtime::ITensor::SharedPtr>
@@ -347,15 +422,17 @@ public:
     using BeamTokens = Base::BeamTokens;
     using VecTokens = Base::VecTokens;
 
-    LlmRequest(RequestIdType requestId, SizeType maxNewTokens, std::shared_ptr<std::vector<TokenIdType>> inputTokens,
+    LlmRequest(RequestIdType requestId, SizeType maxNewTokens, std::shared_ptr<VecTokens> inputTokens,
         runtime::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType> endId = std::nullopt,
         std::optional<SizeType> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
         std::optional<TensorPtr> badWordsList = std::nullopt, std::optional<TensorPtr> stopWordsList = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType> promptVocabSize = std::nullopt, bool returnLogProbs = false,
-        std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt)
+        std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt,
+        std::optional<TensorPtr> draftLogits = std::nullopt)
         : Base(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming, endId, padId, embeddingBias,
-            badWordsList, stopWordsList, promptEmbeddingTable, promptVocabSize, returnLogProbs, draftTokens)
+            badWordsList, stopWordsList, promptEmbeddingTable, promptVocabSize, returnLogProbs, draftTokens,
+            draftLogits)
     {
     }
 

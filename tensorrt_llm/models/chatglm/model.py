@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -109,6 +109,7 @@ class ChatGLMParams:
         vocab_size=65024,
     )
     default_config["chatglm3_6b"] = default_config["chatglm2_6b"]
+    default_config["chatglm3_6b_base"] = default_config["chatglm2_6b"]
     default_config["chatglm2_6b_32k"] = deepcopy(default_config["chatglm2_6b"])
     default_config["chatglm2_6b_32k"].rotary_embedding_scaling = 50.0
     default_config["chatglm3_6b_32k"] = default_config["chatglm2_6b_32k"]
@@ -128,7 +129,7 @@ class ChatGLMParams:
         norm_epsilon=1.0e-5,
         num_heads=32,
         num_kv_heads=32,
-        num_layers=28,
+        num_layers=48,
         qkv_bias=True,
         quant_mode=QuantMode(0),
         rmsnorm=False,
@@ -162,36 +163,46 @@ class ChatGLMDecoderLayer(Module):
 
         super().__init__()
 
-        self.model_name = config.model_name
-        self.use_cache = config.use_cache
-        self.rotary_embedding_base = 10000.0
         rotary_embedding_scaling = None
+        self.model_name = config.model_name
+        self.rotary_embedding_base = 10000.0
+        self.use_cache = config.use_cache
+
+        # parameters for Smooth Quantization
+        self.apply_query_key_layer_scaling = config.apply_query_key_layer_scaling
+        self.dtype = config.dtype
+        self.hidden_size = config.hidden_size
+        self.ffn_hidden_size = config.ffn_hidden_size
+        self.max_seq_length = config.max_seq_length
+        self.num_heads = config.num_heads
+        self.num_kv_heads = config.num_kv_heads
+        self.num_layers = config.num_layers
+        self.tp_group = config.mapping.tp_group
+        self.tp_size = config.mapping.tp_size
+        self.hidden_act = config.hidden_act
+        self.bias = config.qkv_bias
+        self.dense_bias = config.linear_bias
 
         if self.model_name in ["chatglm_6b"]:
             self.alpha = (2 * config.num_layers)**0.5
             self.norm = LayerNorm
-            attention_mask_type = AttentionMaskType.bidirectional
-            position_embedding_type = PositionEmbeddingType.chatglm
+            self.attention_mask_type = AttentionMaskType.bidirectional
+            self.position_embedding_type = PositionEmbeddingType.chatglm
         elif config.model_name in [
                 "chatglm2_6b", "chatglm2_6b_32k", "chatglm3_6b",
                 "chatglm3_6b_base", "chatglm3_6b_32k"
         ]:
             self.apply_residual_connection_post_layernorm = config.apply_residual_connection_post_layernorm
             self.norm = RmsNorm if config.rmsnorm else LayerNorm
-            attention_mask_type = AttentionMaskType.causal
-            position_embedding_type = PositionEmbeddingType.rope_gptj
-            if config.model_name in ["chatglm2_6b_32k"]:
-                rotary_embedding_scaling = {
-                    "type": "linear",
-                    "factor": config.rotary_embedding_scaling
-                }
-            elif config.model_name in ["chatglm3_6b_32k"]:
+            self.attention_mask_type = AttentionMaskType.causal
+            self.position_embedding_type = PositionEmbeddingType.rope_gptj
+            if config.model_name in ["chatglm2_6b_32k", "chatglm3_6b_32k"]:
                 self.rotary_embedding_base *= config.rotary_embedding_scaling
         elif config.model_name in ["glm_10b"]:
             self.apply_residual_connection_post_layernorm = config.apply_residual_connection_post_layernorm
             self.norm = LayerNorm
-            attention_mask_type = AttentionMaskType.bidirectionalglm
-            position_embedding_type = PositionEmbeddingType.learned_absolute
+            self.attention_mask_type = AttentionMaskType.bidirectionalglm
+            self.position_embedding_type = PositionEmbeddingType.learned_absolute
 
         self.pre_norm = self.norm(
             normalized_shape=config.hidden_size,
@@ -207,13 +218,12 @@ class ChatGLMDecoderLayer(Module):
             max_position_embeddings=config.max_seq_length,
             num_layers=config.num_layers,
             apply_query_key_layer_scaling=config.apply_query_key_layer_scaling,
-            attention_mask_type=attention_mask_type,
+            attention_mask_type=self.attention_mask_type,
             bias=config.qkv_bias,
             dtype=config.dtype,
-            position_embedding_type=position_embedding_type,
+            position_embedding_type=self.position_embedding_type,
             rotary_embedding_base=self.rotary_embedding_base,
             rotary_embedding_scaling=rotary_embedding_scaling,
-            use_int8_kv_cache=config.quant_mode.has_int8_kv_cache(),
             rotary_embedding_percentage=0.5,
             tp_group=config.mapping.tp_group,
             tp_size=config.mapping.tp_size,
@@ -393,19 +403,23 @@ class ChatGLMModel(Module):
         if self.use_cache:
             presents = []
 
-        for layer, past, pointer, max_kv_cache_length in zip(
+        for layer, past, pointer, host_pointer, max_attention_window_size in zip(
                 self.layers, kv_cache_params.past_key_value,
                 kv_cache_params.kv_cache_block_pointers,
-                kv_cache_params.host_max_kv_cache_lengths):
+                kv_cache_params.host_kv_cache_block_pointers,
+                kv_cache_params.host_max_attention_window_sizes):
             layer_output = layer(
                 hidden_states,
                 position_ids,
                 kv_cache_params=KeyValueCacheParams(
                     past_key_value=[past],
                     kv_cache_block_pointers=[pointer],
+                    host_kv_cache_block_pointers=[host_pointer],
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
-                    host_max_kv_cache_lengths=max_kv_cache_length,
+                    host_max_attention_window_sizes=max_attention_window_size,
+                    host_sink_token_length=kv_cache_params.
+                    host_sink_token_length,
                     cache_indirection=kv_cache_params.cache_indirection,
                 ),
                 attention_params=attention_params,
@@ -568,6 +582,8 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
         max_new_tokens: int = 0,
         use_cache: bool = True,
         max_beam_width: int = 1,
+        gather_all_token_logits: bool = False,
+        use_custom_all_reduce: bool = False,
     ):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
@@ -589,10 +605,10 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
             use_gpt_attention_plugin=default_net().plugin_config.
             gpt_attention_plugin,
             use_gemm_plugin=default_net().plugin_config.gemm_plugin,
-            use_custom_all_reduce=False,
+            use_custom_all_reduce=use_custom_all_reduce,
             paged_kv_cache=default_net().plugin_config.paged_kv_cache,
             tokens_per_block=self.tokens_per_block,
-            gather_all_token_logits=False,
+            gather_all_token_logits=gather_all_token_logits,
             dtype=self.kv_dtype,
             num_heads=self.num_heads,
             mapping=self.mapping,
@@ -601,22 +617,26 @@ class ChatGLMHeadModel(ChatGLMModel, GenerationMixin):
             position_encoding_2d=(self.model_name in ["chatglm_6b", "glm_10b"]),
         )
 
-        return (model_inputs['input_ids'], model_inputs['position_ids'],
-                model_inputs['last_token_ids'],
-                KeyValueCacheParams(
-                    past_key_value=model_inputs['past_key_value'],
-                    host_past_key_value_lengths=model_inputs[
-                        'host_past_key_value_lengths'],
-                    host_max_kv_cache_lengths=model_inputs[
-                        'host_max_kv_cache_lengths'],
-                    kv_cache_block_pointers=model_inputs[
-                        'kv_cache_block_pointers_list'],
-                    cache_indirection=model_inputs['cache_indirection'],
-                ),
-                AttentionParams(
-                    sequence_length=model_inputs['sequence_length'],
-                    context_lengths=model_inputs['context_lengths'],
-                    host_context_lengths=model_inputs['host_context_lengths'],
-                    max_context_length=max_input_len,
-                    host_request_types=model_inputs['host_request_types'],
-                ))
+        return (
+            model_inputs['input_ids'], model_inputs['position_ids'],
+            model_inputs['last_token_ids'],
+            KeyValueCacheParams(
+                past_key_value=model_inputs['past_key_value'],
+                host_past_key_value_lengths=model_inputs[
+                    'host_past_key_value_lengths'],
+                host_max_attention_window_sizes=model_inputs[
+                    'host_max_attention_window_sizes'],
+                host_sink_token_length=model_inputs['host_sink_token_length'],
+                kv_cache_block_pointers=model_inputs[
+                    'kv_cache_block_pointers_list'],
+                host_kv_cache_block_pointers=model_inputs[
+                    'host_kv_cache_block_pointers_list'],
+                cache_indirection=model_inputs['cache_indirection'],
+            ),
+            AttentionParams(
+                sequence_length=model_inputs['sequence_length'],
+                context_lengths=model_inputs['context_lengths'],
+                host_context_lengths=model_inputs['host_context_lengths'],
+                max_context_length=max_input_len,
+                host_request_types=model_inputs['host_request_types'],
+            ))

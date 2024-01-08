@@ -5,8 +5,9 @@ graphviz
 mypy
 parameterized
 pre-commit
-pynvml>=11.5.0
+pybind11-stubgen
 pytest-cov
 pytest-forked
 pytest-xdist
 pywin32
+typing-extensions==4.8.0

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@
 
 #include <NvInferRuntime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
@@ -237,6 +238,39 @@ public:
     //! \brief A convenience function for converting a tensor shape to a `string`.
     //!
     static std::string toString(Shape const& dims);
+
+    //!
+    //! \brief A convenience function to compare shapes.
+    //!
+    static bool shapeEquals(Shape const& lhs, Shape const& rhs)
+    {
+        return shapeEquals(lhs, rhs.d, rhs.nbDims);
+    }
+
+    //!
+    //! \brief A convenience function to compare shapes.
+    //!
+    template <typename T>
+    static bool shapeEquals(Shape const& lhs, T const* dims, SizeType count)
+    {
+        return lhs.nbDims == count && std::equal(lhs.d, lhs.d + lhs.nbDims, dims);
+    }
+
+    bool shapeEquals(Shape const& other) const
+    {
+        return shapeEquals(getShape(), other);
+    }
+
+    bool shapeEquals(std::initializer_list<SizeType> const& other) const
+    {
+        return shapeEquals(getShape(), other.begin(), other.size());
+    }
+
+    template <typename T>
+    bool shapeEquals(T const* dims, SizeType count) const
+    {
+        return shapeEquals(getShape(), dims, count);
+    }
 
 protected:
     ITensor() = default;

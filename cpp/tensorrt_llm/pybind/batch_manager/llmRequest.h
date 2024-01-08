@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,13 +18,12 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
-#include "tensorrt_llm/common/assert.h"
 
 #include <ATen/ATen.h>
-
 #include <ATen/ops/tensor.h>
 #include <memory>
 #include <optional>
+#include <pybind11/pybind11.h>
 
 namespace tensorrt_llm::pybind::batch_manager
 {
@@ -47,16 +46,18 @@ public:
         std::optional<TensorPtr> badWordsList = std::nullopt, std::optional<TensorPtr> stopWordsList = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType> promptVocabSize = std::nullopt, bool returnLogProbs = false,
-        std::optional<VecTokens> draftTokens = std::nullopt)
+        std::optional<VecTokens> draftTokens = std::nullopt, std::optional<TensorPtr> draftLogits = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming, endId, padId, embeddingBias, badWordsList, stopWordsList, promptEmbeddingTable,
             promptVocabSize, returnLogProbs,
             draftTokens.has_value() ? std::make_shared<VecTokens>(std::move(draftTokens.value()))
-                                    : std::make_shared<VecTokens>())
+                                    : std::make_shared<VecTokens>(),
+            draftLogits)
     {
     }
 
     [[nodiscard]] std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest> toTrtLlm() const;
+    static void initBindings(pybind11::module_& m);
 };
 
 } // namespace tensorrt_llm::pybind::batch_manager

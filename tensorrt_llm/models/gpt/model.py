@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+from typing import List, Optional
 
 import tensorrt as trt
 
@@ -21,9 +21,9 @@ from ..._common import default_net
 from ..._utils import pad_vocab_size, str_dtype_to_trt
 from ...functional import (Tensor, gather_last_token_logits,
                            is_gated_activation, non_gated_version)
-from ...layers import (MLP, Attention, AttentionMaskType, AttentionParams,
+from ...layers import (MLP, MOE, Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, GatedMLP, KeyValueCacheParams,
-                       LayerNorm, LoraParams, PositionEmbeddingType,
+                       LayerNorm, LoraParams, MoeConfig, PositionEmbeddingType,
                        PromptTuningEmbedding)
 from ...mapping import Mapping
 from ...module import Module, ModuleList
@@ -36,10 +36,23 @@ def MLPFactory(hidden_size,
                hidden_act,
                bias=True,
                dtype=None,
+               moe_config: MoeConfig = MoeConfig(),
                tp_group=None,
                tp_size=1,
+               tp_rank=0,
                quant_mode=QuantMode(0),
                instance_id: int = 0):
+    if moe_config.has_moe():
+        return MOE(moe_config,
+                   hidden_size,
+                   ffn_hidden_size,
+                   hidden_act,
+                   bias,
+                   dtype,
+                   tp_group,
+                   tp_size,
+                   tp_rank,
+                   quant_mode=quant_mode)
     MLPClass = GatedMLP if is_gated_activation(hidden_act) else MLP
     hidden_act = non_gated_version(hidden_act)
     return MLPClass(hidden_size, ffn_hidden_size, hidden_act, bias, dtype,
@@ -116,6 +129,8 @@ class GPTDecoderLayer(Module):
                  inter_size=None,
                  bias=True,
                  num_kv_heads=None,
+                 moe_config: MoeConfig = MoeConfig(),
+                 use_auto_parallel=False,
                  tp_group=None,
                  tp_size=1,
                  tp_rank=0,
@@ -151,8 +166,8 @@ class GPTDecoderLayer(Module):
             bias=bias,
             tp_group=tp_group,
             tp_size=tp_size,
+            use_auto_parallel=use_auto_parallel,
             tp_rank=tp_rank,
-            use_int8_kv_cache=quant_mode.has_int8_kv_cache(),
             quant_mode=quant_mode,
             instance_id=2 * instance_id)
 
@@ -164,8 +179,10 @@ class GPTDecoderLayer(Module):
                               hidden_act=hidden_act,
                               dtype=dtype,
                               bias=bias,
+                              moe_config=moe_config,
                               tp_group=tp_group,
                               tp_size=tp_size,
+                              tp_rank=tp_rank,
                               quant_mode=quant_mode,
                               instance_id=2 * instance_id + 1)
         self.post_layernorm = LayerNorm(normalized_shape=hidden_size,
@@ -178,7 +195,7 @@ class GPTDecoderLayer(Module):
                 kv_cache_params=None,
                 attention_params=None,
                 workspace=None,
-                lora_params=None):
+                lora_layer_params=None):
 
         assert isinstance(hidden_states, Tensor)
 
@@ -192,7 +209,7 @@ class GPTDecoderLayer(Module):
                                           kv_cache_params=kv_cache_params,
                                           attention_params=attention_params,
                                           workspace=workspace,
-                                          lora_params=lora_params)
+                                          lora_layer_params=lora_layer_params)
 
         if use_cache:
             attention_output, presents = attention_output
@@ -222,6 +239,7 @@ class GPTModel(Module):
                  max_position_embeddings,
                  dtype=None,
                  mapping=Mapping(),
+                 use_auto_parallel=False,
                  apply_query_key_layer_scaling=False,
                  position_embedding_type=PositionEmbeddingType.learned_absolute,
                  rotary_embedding_percentage=1.0,
@@ -233,7 +251,8 @@ class GPTModel(Module):
                  num_kv_heads=None,
                  use_prompt_tuning=False,
                  use_parallel_embedding=False,
-                 embedding_sharding_dim=0):
+                 embedding_sharding_dim=0,
+                 moe_config=MoeConfig()):
         super().__init__()
         self.mapping = mapping
 
@@ -270,10 +289,12 @@ class GPTModel(Module):
                 tp_group=mapping.tp_group,
                 tp_size=mapping.tp_size,
                 tp_rank=mapping.tp_rank,
+                use_auto_parallel=use_auto_parallel,
                 inter_size=inter_size,
                 bias=bias,
                 quant_mode=quant_mode,
                 instance_id=i,
+                moe_config=moe_config,
             ) for i in range(num_layers)
         ])
 
@@ -304,17 +325,16 @@ class GPTModel(Module):
         if use_cache:
             presents = []
 
-        for layer_idx, (layer, past, pointer, max_kv_cache_length) in enumerate(
-                zip(self.layers, kv_cache_params.past_key_value,
-                    kv_cache_params.kv_cache_block_pointers,
-                    kv_cache_params.host_max_kv_cache_lengths)):
-            lora_param = None
+        for layer_idx, (
+                layer, past, pointer, host_pointer,
+                max_attention_window_size) in enumerate(
+                    zip(self.layers, kv_cache_params.past_key_value,
+                        kv_cache_params.kv_cache_block_pointers,
+                        kv_cache_params.host_kv_cache_block_pointers,
+                        kv_cache_params.host_max_attention_window_sizes)):
+            lora_layer_params = None
             if lora_params.lora_ranks is not None:
-                lora_param = LoraParams(
-                    lora_ranks=lora_params.lora_ranks,
-                    lora_weights_pointers_list=[
-                        lora_params.lora_weights_pointers_list[layer_idx]
-                    ])
+                lora_layer_params = lora_params.get_layer_params(layer_idx)
 
             hidden_states = layer(
                 hidden_states,
@@ -324,12 +344,15 @@ class GPTModel(Module):
                     past_key_value=[past],
                     host_past_key_value_lengths=kv_cache_params.
                     host_past_key_value_lengths,
-                    host_max_kv_cache_lengths=max_kv_cache_length,
+                    host_max_attention_window_sizes=max_attention_window_size,
+                    host_sink_token_length=kv_cache_params.
+                    host_sink_token_length,
                     kv_cache_block_pointers=[pointer],
+                    host_kv_cache_block_pointers=[host_pointer],
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params,
                 workspace=workspace,
-                lora_params=lora_param)
+                lora_layer_params=lora_layer_params)
 
             if use_cache:
                 presents.append(hidden_states[1])
@@ -354,6 +377,7 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                  dtype,
                  logits_dtype='float32',
                  mapping=Mapping(),
+                 use_auto_parallel=False,
                  apply_query_key_layer_scaling=False,
                  position_embedding_type=PositionEmbeddingType.learned_absolute,
                  rotary_embedding_percentage=1.0,
@@ -366,6 +390,7 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                  use_prompt_tuning=False,
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
+                 moe_config=MoeConfig(),
                  share_embedding_table=False):
 
         if isinstance(dtype, str):
@@ -410,6 +435,7 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
             max_position_embeddings=max_position_embeddings,
             dtype=dtype,
             mapping=mapping,
+            use_auto_parallel=use_auto_parallel,
             apply_query_key_layer_scaling=apply_query_key_layer_scaling,
             position_embedding_type=position_embedding_type,
             rotary_embedding_percentage=rotary_embedding_percentage,
@@ -422,6 +448,7 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
             use_prompt_tuning=use_prompt_tuning,
             use_parallel_embedding=use_parallel_embedding,
             embedding_sharding_dim=embedding_sharding_dim,
+            moe_config=moe_config,
         )
         vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
 
@@ -487,7 +514,8 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
                        max_num_tokens: int = None,
                        prompt_embedding_table_size: int = 0,
                        gather_all_token_logits: bool = False,
-                       max_draft_len: int = 0):
+                       max_draft_len: int = 0,
+                       lora_target_modules: List[str] = None):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -529,28 +557,42 @@ class GPTLMHeadModel(GPTModel, GenerationMixin):
             max_num_tokens=max_num_tokens,
             prompt_embedding_table_size=prompt_embedding_table_size,
             use_lora_plugin=use_lora_plugin,
-            max_draft_len=max_draft_len)
+            max_draft_len=max_draft_len,
+            lora_target_modules=lora_target_modules)
 
-        return (model_inputs['input_ids'], model_inputs['position_ids'], True,
-                model_inputs['last_token_ids'], model_inputs['attention_mask'],
-                KeyValueCacheParams(
-                    past_key_value=model_inputs['past_key_value'],
-                    host_past_key_value_lengths=model_inputs[
-                        'host_past_key_value_lengths'],
-                    host_max_kv_cache_lengths=model_inputs[
-                        'host_max_kv_cache_lengths'],
-                    kv_cache_block_pointers=model_inputs[
-                        'kv_cache_block_pointers_list'],
-                    cache_indirection=model_inputs['cache_indirection'],
-                ),
-                AttentionParams(
-                    sequence_length=model_inputs['sequence_length'],
-                    context_lengths=model_inputs['context_lengths'],
-                    host_context_lengths=model_inputs['host_context_lengths'],
-                    max_context_length=max_input_len,
-                    host_request_types=model_inputs['host_request_types']),
-                model_inputs['prompt_embedding_table'], model_inputs['tasks'],
-                model_inputs['prompt_vocab_size'],
-                model_inputs['all_reduce_workspace'],
-                LoraParams(model_inputs['lora_ranks'],
-                           model_inputs['lora_weights_pointers_list']))
+        return (
+            model_inputs['input_ids'],
+            model_inputs['position_ids'],
+            True,
+            model_inputs['last_token_ids'],
+            model_inputs['attention_mask'],
+            KeyValueCacheParams(
+                past_key_value=model_inputs['past_key_value'],
+                host_past_key_value_lengths=model_inputs[
+                    'host_past_key_value_lengths'],
+                host_max_attention_window_sizes=model_inputs[
+                    'host_max_attention_window_sizes'],
+                host_sink_token_length=model_inputs['host_sink_token_length'],
+                kv_cache_block_pointers=model_inputs[
+                    'kv_cache_block_pointers_list'],
+                host_kv_cache_block_pointers=model_inputs[
+                    'host_kv_cache_block_pointers_list'],
+                cache_indirection=model_inputs['cache_indirection'],
+            ),
+            AttentionParams(
+                sequence_length=model_inputs['sequence_length'],
+                context_lengths=model_inputs['context_lengths'],
+                host_context_lengths=model_inputs['host_context_lengths'],
+                max_context_length=max_input_len,
+                host_request_types=model_inputs['host_request_types']),
+            model_inputs['prompt_embedding_table'],
+            model_inputs['tasks'],
+            model_inputs['prompt_vocab_size'],
+            model_inputs['all_reduce_workspace'],
+            LoraParams(
+                model_inputs['lora_ranks'],
+                model_inputs['lora_weights_pointers'],
+                host_context_lengths=model_inputs['host_context_lengths'],
+                max_context_length=max_input_len,
+                host_request_types=model_inputs['host_request_types']),
+        )

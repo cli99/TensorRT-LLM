@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,7 +32,6 @@ def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, *args):
             '--dtype=float16',
             '--logits_dtype=float16',
             '--use_gemm_plugin=float16',
-            '--use_layernorm_plugin=float16',
             '--max_batch_size=32',
             '--max_input_len=40',
             '--max_output_len=20',

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,32 +16,30 @@
  */
 #include "namedTensor.h"
 
-#include "tensorrt_llm/batch_manager/inferenceRequest.h"
-#include "tensorrt_llm/common/stringUtils.h"
-#include "tensorrt_llm/runtime/torchUtils.h"
-#include "tensorrt_llm/runtime/torchView.h"
-#include <memory>
+#include "tensorrt_llm/runtime/torch.h"
 
+#include <pybind11/functional.h>
+#include <pybind11/operators.h>
+#include <pybind11/stl.h>
+#include <torch/extension.h>
+
+namespace py = pybind11;
 namespace tb = tensorrt_llm::batch_manager;
 
 namespace tensorrt_llm::pybind::batch_manager
 {
 
 NamedTensor::NamedTensor(const tb::NamedTensor& cppNamedTensor)
-    : Base(cppNamedTensor.name)
+    : Base(runtime::Torch::tensor(cppNamedTensor.tensor), cppNamedTensor.name)
 {
-    auto cppTensor = cppNamedTensor.tensor;
-    std::vector<at::IntArrayRef::value_type> shapeValues;
-    for (int i = 0; i < cppTensor->getShape().nbDims; ++i)
-    {
-        shapeValues.push_back(cppTensor->getShape().d[i]);
-    }
+}
 
-    tensor = at::from_blob(cppTensor->data(), shapeValues,
-        at::TensorOptions()
-            .device(runtime::TorchUtils::deviceType(cppTensor->getMemoryType()))
-            .pinned_memory(cppTensor->getMemoryType() == runtime::MemoryType::kPINNED)
-            .dtype(runtime::TorchUtils::dataType(cppTensor->getDataType())));
+void NamedTensor::initBindings(py::module_& m)
+{
+    py::class_<NamedTensor>(m, "NamedTensor")
+        .def(py::init<NamedTensor::TensorPtr, std::string>(), py::arg("tensor"), py::arg("name"))
+        .def_readwrite("tensor", &NamedTensor::tensor)
+        .def_readonly("name", &NamedTensor::name);
 }
 
 } // namespace tensorrt_llm::pybind::batch_manager

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,19 +30,22 @@ public:
     using SizeType = tensorrt_llm::runtime::SizeType;
 
     explicit KvCacheConfig(std::optional<SizeType> maxTokens = std::nullopt,
-        std::optional<SizeType> maxKvCacheLength = std::nullopt,
-        std::optional<float> freeGpuMemoryFraction = std::nullopt)
+        std::optional<SizeType> maxAttentionWindow = std::nullopt,
+        std::optional<SizeType> sinkTokenLength = std::nullopt,
+        std::optional<float> freeGpuMemoryFraction = std::nullopt, bool enableBlockReuse = false)
         : maxTokens{maxTokens}
-        , maxKvCacheLength{maxKvCacheLength}
+        , maxAttentionWindow{maxAttentionWindow}
+        , sinkTokenLength{sinkTokenLength}
         , freeGpuMemoryFraction{freeGpuMemoryFraction}
+        , enableBlockReuse(enableBlockReuse)
     {
     }
 
     std::optional<SizeType> maxTokens;
-    std::optional<SizeType> maxKvCacheLength;
+    std::optional<SizeType> maxAttentionWindow;
+    std::optional<SizeType> sinkTokenLength;
     std::optional<float> freeGpuMemoryFraction;
-
+    bool enableBlockReuse;
     static constexpr auto kDefaultGpuMemFraction = 0.85f;
 };
-
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

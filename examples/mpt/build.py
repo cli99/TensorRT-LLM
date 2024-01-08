@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import math
 import time
 from pathlib import Path
 from typing import List
@@ -31,9 +32,9 @@ from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
 
-from weight import get_scaling_factors, load_from_ft, parse_ft_config, check_embedding_share  # isort:skip
+from weight import get_scaling_factors, load_from_ft, parse_ft_config, check_embedding_share, load_from_awq_mpt  # isort:skip
 
-MODEL_NAME = "gpt"
+MODEL_NAME = "mpt"
 
 
 def get_engine_name(model, dtype, tp_size, rank):
@@ -53,7 +54,7 @@ def serialize_engine(engine, path):
     logger.info(f'Serializing engine to {path}...')
     tik = time.time()
     with open(path, 'wb') as f:
-        f.write(bytearray(engine))
+        f.write(engine)
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Engine serialized. Total time: {t}')
@@ -66,6 +67,7 @@ def parse_arguments(args):
                         default=1,
                         help='world size, only support tensor parallelism now')
     parser.add_argument('--model_dir', type=str, default=None)
+    parser.add_argument('--quant_ckpt_path', type=str, default=None)
     parser.add_argument('--dtype',
                         type=str,
                         default='float16',
@@ -80,6 +82,14 @@ def parse_arguments(args):
         default='model.cache',
         help=
         'The path of to read timing cache from, will be ignored if the file does not exist'
+    )
+    parser.add_argument(
+        '--profiling_verbosity',
+        type=str,
+        default='layer_names_only',
+        choices=['layer_names_only', 'detailed', 'none'],
+        help=
+        'The profiling verbosity for the generated TRT engine. Set to detailed can inspect tactic choices and kernel parameters.'
     )
     parser.add_argument('--log_level', type=str, default='info')
     parser.add_argument('--vocab_size', type=int, default=51200)
@@ -150,7 +160,7 @@ def parse_arguments(args):
     parser.add_argument(
         '--output_dir',
         type=Path,
-        default='gpt_outputs',
+        default='engine_outputs',
         help=
         'The path to save the serialized engine files, timing cache file and model configs'
     )
@@ -179,7 +189,7 @@ def parse_arguments(args):
         type=str,
         nargs='?',
         default='int8',
-        choices=['int8', 'int4'],
+        choices=['int8', 'int4', 'int4_awq'],
         help=
         'Define the precision for the weights when using weight-only quantization.'
         'You must also use --use_weight_only for that argument to have an impact.'
@@ -200,6 +210,18 @@ def parse_arguments(args):
         'By default, we use a single static scaling factor to scale activations in the int8 range. '
         'per_token chooses at run time, and for each token, a custom scaling factor. '
         'The latter is usually more accurate, but a little slower.')
+    parser.add_argument(
+        '--per_group',
+        default=False,
+        action="store_true",
+        help=
+        'By default, we use a single static scaling factor to scale weights in the int4 range. '
+        'per_group chooses at run time, and for each group, a custom scaling factor. '
+        'The flag is built for GPTQ/AWQ quantization.')
+    parser.add_argument('--group_size',
+                        type=int,
+                        default=128,
+                        help='Group size used in GPTQ/AWQ quantization.')
     parser.add_argument(
         '--int8_kv_cache',
         default=False,
@@ -222,7 +244,7 @@ def parse_arguments(args):
     )
     parser.add_argument('--tokens_per_block',
                         type=int,
-                        default=64,
+                        default=128,
                         help='Number of tokens per block in paged KV cache')
     parser.add_argument(
         '--max_num_tokens',
@@ -355,8 +377,13 @@ def parse_arguments(args):
         args.quant_mode = QuantMode.use_smooth_quant(args.per_token,
                                                      args.per_channel)
     elif args.use_weight_only:
-        args.quant_mode = QuantMode.use_weight_only(
-            args.weight_only_precision == 'int4')
+        args.quant_mode = QuantMode.from_description(
+            quantize_weights=True,
+            quantize_activations=False,
+            per_token=False,
+            per_channel=False,
+            per_group=args.per_group,
+            use_int4_weights="int4" in args.weight_only_precision)
     else:
         args.quant_mode = QuantMode(0)
 
@@ -376,6 +403,12 @@ def parse_arguments(args):
 
     if args.max_num_tokens is not None:
         assert args.enable_context_fmha
+
+    assert (math.log2(args.tokens_per_block).is_integer()
+            ), "tokens_per_block must be power of 2"
+    if args.enable_context_fmha or args.enable_context_fmha_fp32_acc:
+        assert (args.tokens_per_block >=
+                128), "Context fMHA requires >= 128 tokens per block"
 
     return args
 
@@ -410,7 +443,10 @@ def build_rank_engine(builder: Builder,
     if share_embedding_table:
         logger.info(
             'Engine will share embedding and language modeling weights.')
-
+    # TP only
+    mapping = Mapping(world_size=args.world_size,
+                      rank=rank,
+                      tp_size=args.world_size)
     # Initialize Module
     tensorrt_llm_gpt = tensorrt_llm.models.GPTLMHeadModel(
         num_layers=args.n_layer,
@@ -424,9 +460,7 @@ def build_rank_engine(builder: Builder,
         rotary_embedding_percentage=args.rotary_pct,
         dtype=kv_dtype,
         logits_dtype=args.logits_dtype,
-        mapping=Mapping(world_size=args.world_size,
-                        rank=rank,
-                        tp_size=args.world_size),  # TP only
+        mapping=mapping,
         apply_query_key_layer_scaling=builder_config.
         apply_query_key_layer_scaling,
         quant_mode=args.quant_mode,
@@ -438,7 +472,21 @@ def build_rank_engine(builder: Builder,
         share_embedding_table=share_embedding_table)
 
     quantize_kwargs = {}
-    if args.enable_fp8 or args.fp8_kv_cache:
+    if args.use_smooth_quant or args.use_weight_only:
+        if args.weight_only_precision == 'int4_awq':
+            quantize_kwargs = {
+                "group_size": args.group_size,
+                "zero": False,
+                "pre_quant_scale": True,
+                "exclude_modules": ['lm_head'],
+            }
+        elif args.weight_only_precision == 'int4_gptq':
+            quantize_kwargs = {
+                "group_size": args.group_size,
+                "zero": True,
+                "pre_quant_scale": False,
+            }
+    elif args.enable_fp8 or args.fp8_kv_cache:
         logger.info(f'Loading scaling factors from '
                     f'{args.quantized_fp8_model_path}')
         quant_scales = get_scaling_factors(args.quantized_fp8_model_path,
@@ -447,12 +495,17 @@ def build_rank_engine(builder: Builder,
         quantize_kwargs = {"quant_scales": quant_scales}
     tensorrt_llm_gpt = quantize_model(tensorrt_llm_gpt, args.quant_mode,
                                       **quantize_kwargs)
-
-    if args.model_dir is not None:
+    if args.per_group:
+        assert args.weight_only_precision == 'int4_awq', "We only support awq for now."
+        load_from_awq_mpt(tensorrt_llm_mpt=tensorrt_llm_gpt,
+                          quant_ckpt_path=args.quant_ckpt_path,
+                          mapping=mapping,
+                          dtype=args.dtype,
+                          ft_model_dir=args.model_dir)
+    else:
         load_from_ft(tensorrt_llm_gpt, args.model_dir, rank, args.world_size,
                      args.dtype, args.use_parallel_embedding,
                      args.embedding_sharding_dim, share_embedding_table)
-
     # Module -> Network
     network = builder.create_network()
     network.trt_network.name = engine_name
@@ -486,12 +539,15 @@ def build_rank_engine(builder: Builder,
         network.plugin_config.set_smooth_quant_gemm_plugin(dtype=args.dtype)
         network.plugin_config.set_layernorm_quantization_plugin(
             dtype=args.dtype)
-
         network.plugin_config.set_quantize_tensor_plugin()
         network.plugin_config.set_quantize_per_token_plugin()
     elif args.use_weight_only:
-        network.plugin_config.set_weight_only_quant_matmul_plugin(
-            dtype=args.dtype)
+        if args.per_group:
+            network.plugin_config.set_weight_only_groupwise_quant_matmul_plugin(
+                dtype=args.dtype)
+        else:
+            network.plugin_config.set_weight_only_quant_matmul_plugin(
+                dtype=args.dtype)
 
     if args.world_size > 1:
         network.plugin_config.set_nccl_plugin(args.dtype)
@@ -541,13 +597,18 @@ def build(rank, args):
         # skip other ranks if parallel_build is enabled
         if args.parallel_build and cur_rank != rank:
             continue
-        # NOTE: when only int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
-        int8_trt_flag = args.quant_mode.has_act_or_weight_quant() or (
-            not args.paged_kv_cache and args.quant_mode.has_int8_kv_cache())
+        # NOTE: int8 flag is required to be true when INT8 tensors are exposed to TRT
+        # TRT-LLM has INT8 I/O when act/weights are quantized without group-scaling (AWQ, GPTQ)
+        # OR INT8 KV cache is set to contiguous (without paged KV cache enabled).
+        int8_trt_flag = (args.quant_mode.has_act_or_weight_quant()
+                         and not args.quant_mode.has_per_group_scaling()) or (
+                             not args.paged_kv_cache
+                             and args.quant_mode.has_int8_kv_cache())
         builder_config = builder.create_builder_config(
             name=MODEL_NAME,
             precision=args.dtype,
             timing_cache=timing_cache,
+            profiling_verbosity=args.profiling_verbosity,
             tensor_parallel=args.world_size,  # TP only
             parallel_build=args.parallel_build,
             num_layers=args.n_layer,

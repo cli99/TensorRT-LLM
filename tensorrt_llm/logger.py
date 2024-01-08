@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,8 +16,6 @@ import logging
 import os
 
 import tensorrt as trt
-
-from ._utils import mpi_rank, mpi_world_size
 
 try:
     from polygraphy.logger import G_LOGGER
@@ -53,6 +51,7 @@ class Logger(metaclass=Singleton):
         if invalid_severity:
             min_severity = "warning"
 
+        self._min_severity = min_severity
         self._trt_logger = trt.Logger(severity_map[min_severity][0])
         logging.basicConfig(level=severity_map[min_severity][1],
                             format='[%(asctime)s] %(message)s',
@@ -63,8 +62,6 @@ class Logger(metaclass=Singleton):
             self._polygraphy_logger.module_severity = severity_map[
                 min_severity][2]
 
-        self.mpi_rank = mpi_rank()
-        self.mpi_size = mpi_world_size()
         if invalid_severity:
             self.warning(
                 f"Requested log level {environ_severity} is invalid. Using 'warning' instead"
@@ -89,10 +86,7 @@ class Logger(metaclass=Singleton):
         return self._trt_logger
 
     def log(self, severity, msg):
-        if self.mpi_size > 1:
-            msg = f'[TRT-LLM] [MPI_Rank {self.mpi_rank}] {severity} ' + msg
-        else:
-            msg = f'[TRT-LLM] {severity} ' + msg
+        msg = f'[TRT-LLM] {severity} ' + msg
         self._func_wrapper(severity)(msg)
 
     def critical(self, msg):
@@ -112,12 +106,17 @@ class Logger(metaclass=Singleton):
     def debug(self, msg):
         self.log(self.VERBOSE, msg)
 
+    @property
+    def level(self) -> str:
+        return self._min_severity
+
     def set_level(self, min_severity):
         if self._set_from_env:
             self.warning(
                 f"Logger level already set from environment. Discard new verbosity: {min_severity}"
             )
             return
+        self._min_severity = min_severity
         self._trt_logger.min_severity = severity_map[min_severity][0]
         self._logger.setLevel(severity_map[min_severity][1])
         if self._polygraphy_logger is not None:

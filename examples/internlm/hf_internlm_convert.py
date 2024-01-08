@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -192,7 +192,7 @@ def hf_gpt_converter(args):
     saved_dir.mkdir(parents=True, exist_ok=True)
 
     model = AutoModelForCausalLM.from_pretrained(args.in_file,
-                                                 torch_dtype="auto",
+                                                 torch_dtype=torch.float16,
                                                  device_map="auto",
                                                  trust_remote_code=True)
 

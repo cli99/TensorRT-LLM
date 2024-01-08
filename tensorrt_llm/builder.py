@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,42 +12,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
+import json
+import math
 import os
 import time
-from functools import wraps
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Dict, Optional, Union
 
 import tensorrt as trt
 from packaging import version
 
-from tensorrt_llm.quantization import QuantMode
-
+from ._common import _is_building
 from ._utils import to_dict, to_json_file, trt_version
 from .logger import logger
 from .network import Network
-
-
-class _BuildingFlag:
-
-    def __enter__(self):
-        os.environ['IS_BUILDING'] = '1'
-
-    def __exit__(self, type, value, tb):
-        del os.environ['IS_BUILDING']
-
-
-def _is_building(f):
-    '''Use this to decorate functions which are called during engine building/refiting process,
-    otherwise, the plugin registration will fail.
-    '''
-
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        with _BuildingFlag():
-            return f(*args, **kwargs)
-
-    return decorated
+from .plugin import PluginConfig
+from .plugin.plugin import ContextFMHAType
+from .quantization import QuantMode
 
 
 class BuilderConfig(object):
@@ -67,6 +50,28 @@ class BuilderConfig(object):
     def trt_builder_config(self) -> trt.IBuilderConfig:
         return self._trt_builder_config
 
+    def to_dict(self) -> Dict:
+        '''return a dict with keys
+        {
+            "builder_config": {
+                # all key values set by the _init function
+            },
+            "plugin_config": {
+                # the network plugin_config (if any) attached to this BuilderConfig object
+                # inside the Builder.build_engine
+            }
+        }
+        '''
+        config = {'builder_config': {}}
+        for k in self.__dict__.keys():
+            if k != '_trt_builder_config' and k != 'plugin_config':
+                config['builder_config'][k] = self.__getattribute__(k)
+        if hasattr(self, 'plugin_config'):
+            assert isinstance(self.plugin_config, PluginConfig), \
+                f"Found unexpected plugin_config object with type: {type(self.plugin_config)}"
+            config['plugin_config'] = to_dict(self.plugin_config)
+        return config
+
 
 class Builder():
 
@@ -82,17 +87,23 @@ class Builder():
         return self._trt_builder
 
     def create_network(self) -> Network:
+        explicit_batch_flag = 0
+        if "EXPLICIT_BATCH" in trt.NetworkDefinitionCreationFlag.__members__.keys(
+        ):
+            # Explicit batch flag will be deprecated in TRT 10
+            explicit_batch_flag = 1 << int(
+                trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+
         if version.parse(trt_version()) >= version.parse(
                 "9.1.0") and self.strongly_typed:
             return Network()._init(
                 self.trt_builder.create_network(
-                    (1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+                    explicit_batch_flag
                     | (1 << int(
                         trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED))))
         else:
             return Network()._init(
-                self.trt_builder.create_network(
-                    1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)))
+                self.trt_builder.create_network(explicit_batch_flag))
 
     def create_builder_config(self,
                               precision: str,
@@ -103,6 +114,7 @@ class Builder():
                               int8: bool = False,
                               strongly_typed: bool = False,
                               opt_level: Optional[int] = None,
+                              profiling_verbosity: str = "layer_names_only",
                               **kwargs) -> BuilderConfig:
         ''' @brief Create a builder config with given precisions and timing cache
             @param precision: one of allowed precisions, defined in Builder._ALLOWED_PRECISIONS
@@ -128,11 +140,10 @@ class Builder():
         config = self.trt_builder.create_builder_config()
         if not strongly_typed:
             fp8 = quant_mode.has_fp8_qdq() or quant_mode.has_fp8_kv_cache()
-
-            if precision == 'float16':
+            if precision == 'float16' or precision == trt.DataType.HALF:
                 config.set_flag(trt.BuilderFlag.FP16)
                 config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
-            elif precision == 'bfloat16':
+            elif precision == 'bfloat16' or precision == trt.DataType.BF16:
                 config.set_flag(trt.BuilderFlag.BF16)
                 config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
             if int8:
@@ -150,6 +161,14 @@ class Builder():
 
         if opt_level is not None:
             config.builder_optimization_level = opt_level
+
+        # Set TRT Engine profiling verbosity
+        if profiling_verbosity == "detailed":
+            config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
+        elif profiling_verbosity == "none":
+            config.profiling_verbosity = trt.ProfilingVerbosity.NONE
+        else:
+            config.profiling_verbosity = trt.ProfilingVerbosity.LAYER_NAMES_ONLY
 
         # set timing cache
         cache = None
@@ -190,10 +209,23 @@ class Builder():
             profile = self.trt_builder.create_optimization_profile()
             for input_name in input_tensors.keys():
                 shape_profile = input_tensors[input_name].profiles[i]
-                profile.set_shape(input_name, shape_profile.min,
-                                  shape_profile.opt, shape_profile.max)
+                min_shape = [*shape_profile.min]
+                opt_shape = [*shape_profile.opt]
+                max_shape = [*shape_profile.max]
+                if network._autopp_config is not None:
+                    io_shards = network._autopp_config["io_shards"]
+                    if input_name in io_shards:
+                        shards = io_shards[input_name]
+                        for dim, shard_num in shards.items():
+                            min_shape[dim] = int(
+                                math.floor(min_shape[dim] / shard_num))
+                            opt_shape[dim] = int(
+                                round(opt_shape[dim] / shard_num))
+                            max_shape[dim] = int(
+                                math.ceil(max_shape[dim] / shard_num))
+                profile.set_shape(input_name, min_shape, opt_shape, max_shape)
                 logger.debug(
-                    f'{input_name}, min: {shape_profile.min}, opt: {shape_profile.opt}, max: {shape_profile.max}, dimension names: {shape_profile.dimension_names}'
+                    f'{input_name}, min: {min_shape}, opt: {opt_shape}, max: {max_shape}, dimension names: {shape_profile.dimension_names}'
                 )
             builder_config.trt_builder_config.add_optimization_profile(profile)
         assert self._validate_named_dimensions(
@@ -289,7 +321,9 @@ class Builder():
         '''
         assert isinstance(network, Network)
         builder_config.plugin_config = network.plugin_config
-        self._add_optimization_profile(network, builder_config)
+        builder_config.autopp_config = network.autopp_config
+        if builder_config.trt_builder_config.num_optimization_profiles == 0:
+            self._add_optimization_profile(network, builder_config)
         engine = None
         logger.info(f'Build TensorRT engine {network.trt_network.name}')
         tik = time.time()
@@ -303,6 +337,7 @@ class Builder():
                     raise RuntimeError(f'Failed to set weight: {name}')
 
         # Build engine
+        network._fill_weights()
         engine = self.trt_builder.build_serialized_network(
             network.trt_network, builder_config.trt_builder_config)
         if engine is None:
@@ -336,10 +371,102 @@ class Builder():
 
     @staticmethod
     def save_config(builder_config: BuilderConfig, config_path: str):
-        config = {'builder_config': {}}
-        for k in builder_config.__dict__.keys():
-            if k != '_trt_builder_config' and k != 'plugin_config':
-                config['builder_config'][k] = builder_config.__getattribute__(k)
-        config['plugin_config'] = to_dict(builder_config.plugin_config)
+        config = builder_config.to_dict()
         to_json_file(config, config_path)
         logger.info(f'Config saved to {config_path}.')
+
+
+@dataclass
+class BuildConfig:
+    max_input_len: int = 256
+    max_output_len: int = 256
+    max_batch_size: int = 8
+    max_beam_width: int = 1
+    max_num_tokens: Optional[int] = None
+    max_prompt_embedding_table_size: int = 0
+    gather_all_token_logits: int = False
+    strongly_typed: bool = False
+    plugin_config: PluginConfig = PluginConfig()
+
+    @classmethod
+    def from_dict(cls, config):
+        max_input_len = config.pop('max_input_len')
+        max_output_len = config.pop('max_output_len')
+        max_batch_size = config.pop('max_batch_size')
+        max_beam_width = config.pop('max_beam_width')
+        max_num_tokens = config.pop('max_num_tokens')
+        max_prompt_embedding_table_size = config.pop(
+            'max_prompt_embedding_table_size', 0)
+        gather_all_token_logits = config.pop('gather_all_token_logits', False)
+        strongly_typed = config.pop('strongly_typed', False)
+
+        plugin_config = PluginConfig()
+        if 'plugin_config' not in config:
+            return cls(
+                max_input_len=max_input_len,
+                max_output_len=max_output_len,
+                max_batch_size=max_batch_size,
+                max_beam_width=max_beam_width,
+                max_num_tokens=max_num_tokens,
+                max_prompt_embedding_table_size=max_prompt_embedding_table_size,
+                gather_all_token_logits=gather_all_token_logits,
+                plugin_config=plugin_config)
+
+        config = config['plugin_config']
+        gpt_attention_plugin = config.pop('gpt_attention_plugin', False)
+        if gpt_attention_plugin:
+            plugin_config.set_gpt_attention_plugin(dtype=gpt_attention_plugin)
+
+        gemm_plugin = config.pop('gemm_plugin', False)
+        if gemm_plugin:
+            plugin_config.set_gemm_plugin(dtype=gemm_plugin)
+
+        lookup_plugin = config.pop('lookup_plugin', False)
+        if lookup_plugin:
+            plugin_config.set_lookup_plugin(dtype=lookup_plugin)
+
+        enable_context_fmha = config.pop('enable_context_fmha', False)
+        enable_context_fmha_fp32_acc = config.pop(
+            'enable_context_fmha_fp32_acc', False)
+        assert not (enable_context_fmha and enable_context_fmha_fp32_acc)
+        if enable_context_fmha:
+            plugin_config.set_context_fmha(ContextFMHAType.enabled)
+        if enable_context_fmha_fp32_acc:
+            plugin_config.set_context_fmha(
+                ContextFMHAType.enabled_with_fp32_acc)
+
+        remove_input_padding = config.pop('remove_input_padding', False)
+        if remove_input_padding:
+            plugin_config.enable_remove_input_padding()
+
+        paged_kv_cache = config.pop('paged_kv_cache', False)
+        tokens_per_block = config.pop('tokens_per_block', 64)
+        if paged_kv_cache:
+            plugin_config.enable_paged_kv_cache(tokens_per_block)
+
+        use_custom_all_reduce = config.pop('use_custom_all_reduce', False)
+        plugin_config.use_custom_all_reduce = use_custom_all_reduce
+
+        return cls(
+            max_input_len=max_input_len,
+            max_output_len=max_output_len,
+            max_batch_size=max_batch_size,
+            max_beam_width=max_beam_width,
+            max_num_tokens=max_num_tokens,
+            max_prompt_embedding_table_size=max_prompt_embedding_table_size,
+            gather_all_token_logits=gather_all_token_logits,
+            strongly_typed=strongly_typed,
+            plugin_config=plugin_config)
+
+    @classmethod
+    def from_json_file(cls, config_file):
+        with open(config_file) as f:
+            config = json.load(f)
+            return BuildConfig.from_dict(config)
+
+    def to_dict(self):
+        output = copy.deepcopy(self.__dict__)
+        plugin_config = output.pop('plugin_config')
+        plugin_config_dict = copy.deepcopy(plugin_config.__dict__)
+        output['plugin_config'] = plugin_config_dict
+        return output

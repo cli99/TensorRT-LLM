@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -179,13 +179,13 @@ void verifyResults(BufferManager& manager, GptDecoderBatch const& decoder,
 }
 
 void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig> const& samplingConfigs,
-    SizeType maxBeamWidth, bool computeLogProbs)
+    SizeType maxBeamWidth, bool computeLogProbs, bool normalizeLogProbs)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     SizeType constexpr tensorParallelism{1};
     SizeType constexpr pipelineParallelism{1};
     SizeType constexpr localRank{0};
-    WorldConfig constexpr worldConfig{tensorParallelism, pipelineParallelism, localRank};
+    WorldConfig const worldConfig{tensorParallelism, pipelineParallelism, localRank};
 
     SizeType constexpr vocabSize{51200};
     SizeType constexpr nbLayers{2};
@@ -238,12 +238,14 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig> con
         samplingConfigs, generatedTokensPerSteps, manager);
     auto outputs = prepareDecoderOutputs(batchSize, maxBeamWidth, maxSeqLength, tiledInputLengths, manager);
 
-    // We set maxKvCacheLength = maxSeqLength, but it can be smaller than maxSeqLength (cyclic kv cache).
-    auto const maxKvCacheLength = maxSeqLength;
+    // We set maxAttentionWindow = maxSeqLength, but it can be smaller than maxSeqLength (cyclic kv cache).
+    auto const maxAttentionWindow = maxSeqLength;
+    SizeType const sinkTokenLength{0};
 
     // set up decoder
     auto decoder = GptDecoderBatch(vocabSize, vocabSizePadded, streamPtr);
-    decoder.setup(batchSize, maxBeamWidth, maxSeqLength, maxKvCacheLength, maxGeneratedTokensPerStep, dataType);
+    decoder.setup(batchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSeqLength, maxGeneratedTokensPerStep,
+        dataType);
 
     for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {
@@ -295,7 +297,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
     SizeType constexpr tensorParallelism{1};
     SizeType constexpr pipelineParallelism{1};
     SizeType constexpr localRank{0};
-    WorldConfig constexpr worldConfig{tensorParallelism, pipelineParallelism, localRank};
+    WorldConfig const worldConfig{tensorParallelism, pipelineParallelism, localRank};
 
     SizeType constexpr vocabSize{51200};
     SizeType constexpr nbLayers{2};
@@ -348,12 +350,14 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
         samplingConfigs, generatedTokensPerSteps, manager);
     auto outputs = prepareDecoderOutputs(batchSize, maxBeamWidth, maxSeqLength, tiledInputLengths, manager);
 
-    // We set maxKvCacheLength = maxSeqLength, but it can be smaller than maxSeqLength (cyclic kv cache).
-    auto const maxKvCacheLength = maxSeqLength;
+    // We set maxAttentionWindow = maxSeqLength, but it can be smaller than maxSeqLength (cyclic kv cache).
+    auto const maxAttentionWindow = maxSeqLength;
+    SizeType const sinkTokenLength{0};
 
     // set up decoder
     auto decoder = GptDecoderBatch(vocabSize, vocabSizePadded, streamPtr);
-    decoder.setup(batchSize, maxBeamWidth, maxSeqLength, maxKvCacheLength, maxGeneratedTokensPerStep, dataType);
+    decoder.setup(batchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSeqLength, maxGeneratedTokensPerStep,
+        dataType);
 
     std::vector<SizeType> expectedSteps(batchSize, 0);
     auto expectedLengths = tiledInputLengths;
@@ -410,7 +414,7 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     SizeType constexpr tensorParallelism{1};
     SizeType constexpr pipelineParallelism{1};
     SizeType constexpr localRank{0};
-    WorldConfig constexpr worldConfig{tensorParallelism, pipelineParallelism, localRank};
+    WorldConfig const worldConfig{tensorParallelism, pipelineParallelism, localRank};
 
     SizeType constexpr vocabSize{51200};
     SizeType constexpr nbLayers{2};
@@ -457,12 +461,14 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
         samplingConfigs, generatedTokensPerSteps, manager);
     auto outputs = prepareDecoderOutputs(batchSize, maxBeamWidth, maxSeqLength, tiledInputLengths, manager);
 
-    // We set maxKvCacheLength = maxSeqLength, but it can be smaller than maxSeqLength (cyclic kv cache).
-    auto const maxKvCacheLength = maxSeqLength;
+    // We set maxAttentionWindow = maxSeqLength, but it can be smaller than maxSeqLength (cyclic kv cache).
+    auto const maxAttentionWindow = maxSeqLength;
+    SizeType const sinkTokenLength{0};
 
     // set up decoder
     auto decoder = GptDecoderBatch(vocabSize, vocabSizePadded, streamPtr);
-    decoder.setup(batchSize, maxBeamWidth, maxSeqLength, maxKvCacheLength, maxGeneratedTokensPerStep, dataType);
+    decoder.setup(batchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSeqLength, maxGeneratedTokensPerStep,
+        dataType);
 
     for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {
@@ -537,7 +543,7 @@ TEST_P(ParamTest, Test)
         samplingConfigs.emplace_back(beamWidth);
     }
 
-    testDecoder(dtype, samplingConfigs, beamConfig.maxBeamWidth, computeLogProbs);
+    testDecoder(dtype, samplingConfigs, beamConfig.maxBeamWidth, computeLogProbs, true);
 }
 
 INSTANTIATE_TEST_SUITE_P(GptDecoderBwTest, ParamTest,
@@ -556,6 +562,7 @@ TEST_P(ParamWavefrontTest, Test)
     nvinfer1::DataType const dtype{std::get<0>(GetParam())};
     BeamConfig const beamConfig{std::get<1>(GetParam())};
     bool const computeLogProbs{std::get<2>(GetParam())};
+    bool const normalizeLogProbs{true};
     std::vector<SamplingConfig> samplingConfigs;
     for (auto const beamWidth : beamConfig.beamWidths)
     {

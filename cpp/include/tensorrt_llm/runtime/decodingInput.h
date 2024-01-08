@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,10 +29,12 @@ class DecodingInput
 public:
     using TensorPtr = std::shared_ptr<ITensor const>;
 
-    DecodingInput(SizeType maxLength, SizeType maxKvCacheLength, SizeType batchSize, TensorPtr logits, TensorPtr endIds)
+    DecodingInput(SizeType maxLength, SizeType maxAttentionWindow, SizeType sinkTokenLength, SizeType batchSize,
+        TensorPtr logits, TensorPtr endIds)
         : step{maxLength}
         , maxLength{maxLength}
-        , maxKvCacheLength{maxKvCacheLength}
+        , maxAttentionWindow{maxAttentionWindow}
+        , sinkTokenLength{sinkTokenLength}
         , batchSize{batchSize}
         , logits{std::move(logits)}
         , endIds{std::move(endIds)}
@@ -44,7 +46,8 @@ public:
     // mandatory parameters
     SizeType step;
     SizeType maxLength;
-    SizeType maxKvCacheLength;
+    SizeType maxAttentionWindow;
+    SizeType sinkTokenLength;
     SizeType batchSize;
     TensorPtr logits; // [batchSize, beamWidth, vocabSizePadded], on gpu
     TensorPtr endIds; // [batchSize * beamWidth], on gpu

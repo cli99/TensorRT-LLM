@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmhaRunner.h"
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fused_multihead_attention_common.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include <cassert>
@@ -40,10 +41,12 @@ public:
         int rotary_embedding_dim, // for RoPE. Use 0 for non-RoPE
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
         float rotary_embedding_scale, int rotary_embedding_max_positions, int tp_size, int tp_rank, // for ALiBi
+        bool unfuse_qkv_gemm,                                                                       // for AutoPP
         tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, int kv_cache_quant_mode,
         bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type, bool paged_kv_cache,
         int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled,
-        bool cross_attention = false, int max_distance = 0);
+        bool cross_attention = false, int max_distance = 0, bool pos_shift_enabled = false,
+        bool dense_context_fmha = false, bool use_paged_context_fmha = false, bool use_cache = true);
 
     GPTAttentionPluginCommon(const void* data, size_t length);
 
@@ -74,10 +77,11 @@ public:
 
 protected:
     int getMaxNumSeqLenTile(int batch_beam_size = 1) const;
-    size_t getWorkspaceSizeForContext(
-        nvinfer1::DataType type, int32_t nbReq, int32_t max_input_length, int32_t cross_qkv_length = 0) const noexcept;
+    size_t getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t nbReq, int32_t max_input_length,
+        int32_t max_kv_cache_len, int32_t cross_qkv_length = 0) const noexcept;
     // total_num_seq is the sum of beam_width for multiple requests
-    size_t getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32_t total_num_seq) const noexcept;
+    size_t getWorkspaceSizeForGeneration(
+        nvinfer1::DataType type, int32_t total_num_seq, int32_t max_kv_cache_length) const noexcept;
 
     template <typename T, typename KVCacheBuffer>
     struct EnqueueContextParams
@@ -85,19 +89,23 @@ protected:
         T const* attention_input;
         T const* qkv_bias;
         int32_t input_seq_length; // padded input length
-        // By default, max_kv_cache_length == cyclic_kv_cache_length
+        int32_t max_past_kv_len;
+        // By default, max_attention_window == cyclic_attention_window_size
         // unless each layer has different cyclic kv cache length.
         // Max cache capacity (used to allocate KV cache)
-        int32_t max_kv_cache_length;
+        int32_t max_attention_window;
         // Cyclic kv cache capacity (used to get the cyclic kv cache position for new tokens)
-        int32_t cyclic_kv_cache_length;
-        int32_t const* context_lengths;
+        int32_t cyclic_attention_window_size;
+        int32_t sink_token_length;
+        int32_t const* q_seq_lengths;
+        int32_t const* kv_seq_lengths;
         float const* kv_scale_orig_quant;
         float const* kv_scale_quant_orig;
         T const* alibi_slopes;
         T* context_buf;
         void* key_value_cache;
         void* block_pointers;
+        void* host_block_pointers;
         int32_t batch_size;
         int32_t num_tokens;
         int32_t max_blocks_per_sequence;
@@ -130,25 +138,32 @@ protected:
         T* context_buf;
         void* key_value_cache;
         void* block_pointers;
-        // By default, max_kv_cache_length == cyclic_kv_cache_length
+        // By default, max_attention_window == cyclic_attention_window_size
         // unless each layer has different cyclic kv cache length.
         // Max cache capacity (used to allocate KV cache)
-        int32_t max_kv_cache_length;
+        int32_t max_attention_window;
         // Cyclic kv cache capacity (used to get the cyclic kv cache position for new tokens)
-        int32_t cyclic_kv_cache_length;
+        int32_t cyclic_attention_window_size;
+        int32_t sink_token_length;
         int32_t num_requests;
         int32_t max_blocks_per_sequence;
         int32_t const* cache_indir;
         void* workspace;
+        int32_t const* host_past_key_value_lengths;
         // optional when relative position
         const T* relative_attention_bias = nullptr;
         int relative_attention_bias_stride = 0;
         // optional when cross attention
         int32_t const* encoder_input_lengths = nullptr;
+        int32_t const* host_context_lengths = nullptr;
     };
 
     template <typename T, typename KVCacheBuffer>
     int enqueueGeneration(const EnqueueGenerationParams<T, KVCacheBuffer>& params, cudaStream_t stream);
+
+    template <typename T, typename KVCacheBuffer>
+    bool convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams& xqaParams,
+        const EnqueueGenerationParams<T, KVCacheBuffer>& generationsParams);
 
     bool isRelativePosition() const
     {
@@ -177,7 +192,14 @@ protected:
         return mCrossAttention;
     }
 
+    bool useKVCache() const
+    {
+        return mUseKVCache;
+    }
+
 protected:
+    static constexpr int kReservedMaxSeqLenTilePerSeq = 64;
+
     const std::string mLayerName;
 
     int mNumHeads;
@@ -198,11 +220,15 @@ protected:
     tensorrt_llm::common::QuantMode mKVCacheQuantMode;
     int mTpSize = 1;
     int mTpRank = 0;
+    bool mUnfuseQkvGemm = false;
     nvinfer1::DataType mType;
     int32_t mMaxContextLength;
     bool mQKVBiasEnabled;
     bool mCrossAttention = false;
     int mMaxDistance = 0;
+    bool mPosShiftEnabled = false;
+    bool mPagedContextFMHA = false;
+    bool mDenseContextFMHA = false;
 
     // fmha runner (disable by default)
     // flag: disabled = 0, enabled = 1, enabled with fp32 accumulation = 2
@@ -210,13 +236,20 @@ protected:
     bool mFMHAForceFP32Acc = false;
     int mSM = tensorrt_llm::common::getSMVersion();
     int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+    int mMaxSharedMemoryPerBlockOptin = tensorrt_llm::common::getMaxSharedMemoryPerBlockOptin();
     // The default copy constructor will leave it as nullptr. clone() shall initialize it.
     UniqPtrWNullCopy<tensorrt_llm::kernels::MHARunner> mFMHARunner;
+    UniqPtrWNullCopy<tensorrt_llm::kernels::DecoderXQARunner> mDecoderXQARunner;
+    // Cache the grid_size and block_size that gives the highest occupancy for
+    //  invokeApplyBiasRopeUpdateKVCache.
+    int2 mLaunchGridBlockCache = make_int2(0, 0);
 
     bool mMultiBlockMode;
     int mDeviceId = -1;
+    static bool mForceMultiBlockWarned;
     // The default copy constructor will leave it as nullptr. clone() shall initialize it.
     UniqPtrWNullCopy<tensorrt_llm::common::CublasMMWrapper> mCublasWrapper;
+    bool mUseKVCache = true;
 };
 
 class GPTAttentionPluginCreatorCommon : public BaseCreator

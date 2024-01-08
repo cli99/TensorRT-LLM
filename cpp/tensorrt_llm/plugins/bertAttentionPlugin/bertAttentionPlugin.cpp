@@ -82,7 +82,7 @@ nvinfer1::DimsExprs BertAttentionPlugin::getOutputDimensions(
 {
     TLLM_CHECK(outputIndex == 0);
     auto ret = inputs[0];
-    ret.d[2] = exprBuilder.constant(ret.d[2]->getConstantValue() / 3);
+    ret.d[mRemovePadding ? 1 : 2] = exprBuilder.constant(ret.d[mRemovePadding ? 1 : 2]->getConstantValue() / 3);
     return ret;
 }
 
@@ -113,6 +113,10 @@ bool BertAttentionPlugin::supportsFormatCombination(
             return (inOut[pos].type == mType) && (inOut[pos].format == TensorFormat::kLINEAR);
         }
     }
+    else
+    {
+        return false;
+    }
 }
 
 void BertAttentionPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDesc* in, int nbInputs,
@@ -123,20 +127,20 @@ void BertAttentionPlugin::configurePlugin(const nvinfer1::DynamicPluginTensorDes
 size_t BertAttentionPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* inputs, int nbInputs,
     const nvinfer1::PluginTensorDesc* outputs, int nbOutputs) const noexcept
 {
-    // if remove padding, inputs[0] "qkv_hidden_states" dim is [1, num_tokens, 3*hidden_dim] which doesn't have shape
+    // if remove padding, inputs[0] "qkv_hidden_states" dim is [num_tokens, 3*hidden_dim] which doesn't have shape
     // info should get max_batch_size and max_input_length from inputs[1] "input_lengths" and input[2]
     // "max_input_length"
     const int batch_size = mRemovePadding ? inputs[1].dims.d[0] : inputs[0].dims.d[0];
     const int input_seq_len = mRemovePadding ? inputs[2].dims.d[0] : inputs[0].dims.d[1];
-    const int local_hidden_units_ = inputs[0].dims.d[2] / 3;
+    const int local_hidden_units_ = inputs[0].dims.d[mRemovePadding ? 1 : 2] / 3;
 
     auto const size = tensorrt_llm::runtime::BufferDataType(inputs[0].type).getSize();
 
     const size_t attention_mask_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_len * input_seq_len;
     const size_t cu_seqlens_size = sizeof(int) * (batch_size + 1);
-    const size_t q_buf_2_size = size * batch_size * input_seq_len * local_hidden_units_;
-    const size_t k_buf_2_size = size * batch_size * input_seq_len * local_hidden_units_;
-    const size_t v_buf_2_size = size * batch_size * input_seq_len * local_hidden_units_;
+    const size_t q_buf_2_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_len * local_hidden_units_;
+    const size_t k_buf_2_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_len * local_hidden_units_;
+    const size_t v_buf_2_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_len * local_hidden_units_;
     const size_t qk_buf_size = mEnableContextFMHA ? 0 : size * batch_size * mNumHeads * input_seq_len * input_seq_len;
     const size_t qkv_buf_2_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_len * local_hidden_units_;
     const size_t qk_buf_float_size
@@ -156,7 +160,7 @@ size_t BertAttentionPlugin::getWorkspaceSize(const nvinfer1::PluginTensorDesc* i
     workspaces[8] = qk_buf_float_size;
     workspaces[9] = padding_offset_size;
 
-    return tensorrt_llm::plugins::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
+    return tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
 }
 
 template <typename T>
@@ -166,22 +170,22 @@ int BertAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc
 {
 
     // inputs
-    //     input_tensor [batch_size, seq_len, local_hidden_size*3] or [1, num_tokens, local_hidden_size*3]
+    //     input_tensor [batch_size, seq_len, local_hidden_size*3] or [num_tokens, local_hidden_size*3]
     //     input_lengths [batch_size]
     //     max_input_length [max_input_length] -- use shape dim to represent max value. If remove padding, this records
     //     the max input length among sequences; otherwise same as input_tensor's padded dim[1] relative_attention_bias
     //     [num_heads, num_buckets] (optional)
     // outputs
-    //     output_tensor [batch_size, seq_len, local_hidden_size] or [1, num_tokens, local_hidden_size]
+    //     output_tensor [batch_size, seq_len, local_hidden_size] or [num_tokens, local_hidden_size]
 
-    // if remove padding, inputs[0] dim is [1, num_tokens] which doesn't have workspace info
+    // if remove padding, inputs[0] dim is [num_tokens] which doesn't have workspace info
     // should get max_batch_size from inputs[1] and max_input_length from plugin attribute
     const int batch_size = mRemovePadding ? inputDesc[1].dims.d[0] : inputDesc[0].dims.d[0];
     const int input_seq_len = mRemovePadding ? inputDesc[2].dims.d[0] : inputDesc[0].dims.d[1];
-    const int num_tokens = mRemovePadding ? inputDesc[0].dims.d[1] : batch_size * input_seq_len;
+    const int num_tokens = mRemovePadding ? inputDesc[0].dims.d[0] : batch_size * input_seq_len;
     const int request_batch_size = batch_size;
     const int request_seq_len = input_seq_len;
-    const int local_hidden_units_ = inputDesc[0].dims.d[2] / 3;
+    const int local_hidden_units_ = inputDesc[0].dims.d[mRemovePadding ? 1 : 2] / 3;
     const float q_scaling = mQScaling;
 
     const T* attention_input = reinterpret_cast<const T*>(inputs[0]);
@@ -210,9 +214,9 @@ int BertAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc
 
     const size_t attention_mask_size = mEnableContextFMHA ? 0 : sizeof(T) * batch_size * input_seq_len * input_seq_len;
     const size_t cu_seqlens_size = sizeof(int) * (batch_size + 1);
-    const size_t q_buf_2_size = sizeof(T) * batch_size * input_seq_len * local_hidden_units_;
-    const size_t k_buf_2_size = sizeof(T) * batch_size * input_seq_len * local_hidden_units_;
-    const size_t v_buf_2_size = sizeof(T) * batch_size * input_seq_len * local_hidden_units_;
+    const size_t q_buf_2_size = mEnableContextFMHA ? 0 : sizeof(T) * batch_size * input_seq_len * local_hidden_units_;
+    const size_t k_buf_2_size = mEnableContextFMHA ? 0 : sizeof(T) * batch_size * input_seq_len * local_hidden_units_;
+    const size_t v_buf_2_size = mEnableContextFMHA ? 0 : sizeof(T) * batch_size * input_seq_len * local_hidden_units_;
     const size_t qk_buf_size
         = mEnableContextFMHA ? 0 : sizeof(T) * batch_size * mNumHeads * input_seq_len * input_seq_len;
     const size_t qkv_buf_2_size = mEnableContextFMHA ? 0 : sizeof(T) * batch_size * input_seq_len * local_hidden_units_;
@@ -224,34 +228,30 @@ int BertAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc
     int8_t* workspace_byte_ptr = reinterpret_cast<int8_t*>(workspace);
     size_t offset = CUBLAS_WORKSPACE_SIZE;
 
-    T* attention_mask = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, attention_mask_size));
-    int* cu_seqlens = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, cu_seqlens_size));
-    T* q_buf_2_ = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, q_buf_2_size));
-    T* k_buf_2_ = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, k_buf_2_size));
-    T* v_buf_2_ = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, v_buf_2_size));
-    T* qk_buf_ = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, qk_buf_size));
-    T* qkv_buf_2_ = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, qkv_buf_2_size));
-    float* qk_buf_float_ = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, qk_buf_float_size));
-    int* padding_offset = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, padding_offset_size));
+    T* attention_mask = reinterpret_cast<T*>(tc::nextWorkspacePtr(workspace_byte_ptr, offset, attention_mask_size));
+    int* cu_seqlens = reinterpret_cast<int*>(tc::nextWorkspacePtr(workspace_byte_ptr, offset, cu_seqlens_size));
+    T* q_buf_2_ = reinterpret_cast<T*>(tc::nextWorkspacePtr(workspace_byte_ptr, offset, q_buf_2_size));
+    T* k_buf_2_ = reinterpret_cast<T*>(tc::nextWorkspacePtr(workspace_byte_ptr, offset, k_buf_2_size));
+    T* v_buf_2_ = reinterpret_cast<T*>(tc::nextWorkspacePtr(workspace_byte_ptr, offset, v_buf_2_size));
+    T* qk_buf_ = reinterpret_cast<T*>(tc::nextWorkspacePtr(workspace_byte_ptr, offset, qk_buf_size));
+    T* qkv_buf_2_ = reinterpret_cast<T*>(tc::nextWorkspacePtr(workspace_byte_ptr, offset, qkv_buf_2_size));
+    float* qk_buf_float_
+        = reinterpret_cast<float*>(tc::nextWorkspacePtr(workspace_byte_ptr, offset, qk_buf_float_size));
+    int* padding_offset = reinterpret_cast<int*>(tc::nextWorkspacePtr(workspace_byte_ptr, offset, padding_offset_size));
 
     // build attention_mask, cu_seqlens, and padding_offset tensors
     BuildDecoderInfoParams<T> params;
     memset(&params, 0, sizeof(params));
-    params.seqOffsets = cu_seqlens;
+    params.seqQOffsets = cu_seqlens;
     params.paddingOffsets = padding_offset;
     params.attentionMask = attention_mask;
-    params.seqLengths = input_lengths;
+    params.seqQLengths = input_lengths;
     params.batchSize = batch_size;
     params.maxSeqLength = input_seq_len;
     params.numTokens = num_tokens;
     params.attentionMaskType = AttentionMaskType::PADDING;
     invokeBuildDecoderInfo(params, stream);
     sync_check_cuda_error();
-
-    invokeAddFusedQKVBiasTranspose(q_buf_2_, k_buf_2_, v_buf_2_, const_cast<T*>(attention_input), input_lengths,
-        mRemovePadding ? padding_offset : nullptr, batch_size, input_seq_len, num_tokens, mNumHeads, mNumHeads,
-        mHeadSize, mEnableContextFMHA, 0, 0.0f, RotaryScalingType::kNONE, 0.0f, 0,
-        PositionEmbeddingType::kLEARNED_ABSOLUTE, (float*) nullptr, 0, stream);
 
     const auto gemm_data_type = tc::CudaDataType<T>::value;
     const int attention_seq_len_1 = request_seq_len; // q length
@@ -277,6 +277,12 @@ int BertAttentionPlugin::enqueueImpl(const nvinfer1::PluginTensorDesc* inputDesc
     }
     else
     {
+        // only non-FMHA path needs to split Q,K,V from QKV
+        invokeAddFusedQKVBiasTranspose(q_buf_2_, k_buf_2_, v_buf_2_, const_cast<T*>(attention_input), input_lengths,
+            mRemovePadding ? padding_offset : nullptr, batch_size, input_seq_len, num_tokens, mNumHeads, mNumHeads,
+            mHeadSize, 0, 0.0f, RotaryScalingType::kNONE, 0.0f, 0, PositionEmbeddingType::kLEARNED_ABSOLUTE,
+            (float*) nullptr, 0, stream);
+
         if (!mQKHalfAccum && gemm_data_type != CUDA_R_32F)
         {
             mCublasWrapper->stridedBatchedGemm(CUBLAS_OP_T, CUBLAS_OP_N,

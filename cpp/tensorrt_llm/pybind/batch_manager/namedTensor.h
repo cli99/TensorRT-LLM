@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,34 +17,30 @@
 
 #pragma once
 
-#include "tensorrt_llm/batch_manager/NamedTensor.h"
-#include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/runtime/iBuffer.h"
+#include "tensorrt_llm/batch_manager/namedTensor.h"
 
 #include <ATen/ATen.h>
 
-#include <ATen/core/ATen_fwd.h>
-#include <ATen/ops/from_blob.h>
-#include <ATen/ops/tensor.h>
-#include <c10/core/DeviceType.h>
-#include <c10/util/ArrayRef.h>
-#include <memory>
 #include <optional>
-
-namespace tb = tensorrt_llm::batch_manager;
+#include <pybind11/pybind11.h>
 
 namespace tensorrt_llm::pybind::batch_manager
 {
 
-struct NamedTensor : public tb::GenericNamedTensor<std::optional<at::Tensor>>
+class NamedTensor : public tensorrt_llm::batch_manager::GenericNamedTensor<std::optional<at::Tensor>>
 {
-    using Base = tb::GenericNamedTensor<std::optional<at::Tensor>>;
+public:
+    using Base = tensorrt_llm::batch_manager::GenericNamedTensor<std::optional<at::Tensor>>;
     using TensorPtr = Base::TensorPtr;
 
     NamedTensor(TensorPtr _tensor, std::string _name)
-        : Base(_tensor, _name){};
+        : Base(std::move(_tensor), std::move(_name)){};
 
-    NamedTensor(const tb::NamedTensor& cppNamedTensor);
+    explicit NamedTensor(std::string _name)
+        : Base(std::move(_name)){};
+
+    explicit NamedTensor(const tensorrt_llm::batch_manager::NamedTensor& cppNamedTensor);
+    static void initBindings(pybind11::module_& m);
 };
 
 } // namespace tensorrt_llm::pybind::batch_manager

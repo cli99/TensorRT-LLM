@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@
 #include <memory>
 #include <random>
 
+#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/samplingPenaltyKernels.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/kernels/samplingTopPKernels.h"
@@ -191,6 +192,7 @@ struct SamplingKernelTestParam
     uint32_t topK;
     float topP;
     int32_t outputLen;
+    bool normalizeLogProbs = false;
 
     SamplingKernelTestParam& setBatchSize(int32_t bs)
     {
@@ -259,8 +261,9 @@ protected:
         std::uniform_int_distribution<>& endIdsDistr);
 
     void verifyCurrentStep(int32_t batchSize, int32_t vocabSize, int32_t maxSeqLen, int32_t step, bool greedySearch,
-        bool useSkipDecode, bool hasDiffRuntimeArgs, std::vector<bool>& refFinished, std::vector<int32_t>& refSeqLength,
-        const std::vector<bool>& finishedCurrentStep);
+        bool useSkipDecode, bool hasDiffRuntimeArgs, std::vector<tensorrt_llm::kernels::FinishedState>& refFinished,
+        std::vector<int32_t>& refSeqLength,
+        const std::vector<tensorrt_llm::kernels::FinishedState>& finishedCurrentStep);
 
 private:
     void runTest(const SamplingKernelTestParam& param, bool hasDiffRuntimeArgs, bool useSkipDecode);

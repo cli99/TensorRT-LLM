@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
+#include <curand_kernel.h>
 
 #include <cstdint>
 #include <memory>
@@ -55,9 +56,17 @@ public:
         DecodingInput const& decodingInput, BufferManager const& manager)
         = 0;
 
-    static void acceptTokens(const ITensor& targetTokenIds, const ITensor& draftTokenIds, const ITensor& contextLengths,
-        const ITensor& numDraftTokens, ITensor& sequenceLengths, const ITensor& finishedVec, ITensor& finishedFinal,
-        ITensor& finishedSum, BufferManager::CudaStreamPtr const& stream);
+    virtual const SamplingConfig& getSamplingConfig() = 0;
+
+    static void acceptDraftTokensByIds(const ITensor& targetTokenIds, const ITensor& draftTokenIds,
+        const ITensor& contextLengths, const ITensor& numDraftTokens, ITensor& sequenceLengths,
+        const ITensor& finishedVec, ITensor& finishedFinal, ITensor& finishedSum,
+        BufferManager::CudaStreamPtr const& stream);
+
+    static void acceptDraftTokensByLogits(ITensor& draftLogits, const ITensor& targetLogits, ITensor& draftProbs,
+        ITensor& targetProbs, const ITensor& numDraftTokens, ITensor& finished, SizeType vocabSize,
+        SizeType vocabSizePadded, bool useRandomAcceptThreshold, float randomAcceptThreshold,
+        curandState_t* curandState, BufferManager::CudaStreamPtr const& stream);
 
     static std::unique_ptr<IGptDecoder> create(
         nvinfer1::DataType dtype, size_t vocabSize, size_t vocabSizePadded, BufferManager::CudaStreamPtr const& stream);
@@ -82,14 +91,18 @@ public:
     void gatherTree(ITensor& finalOutputIds, DecodingOutput const& decodingOutput, DecodingInput const& decodingInput,
         BufferManager const& manager) override;
 
+    const SamplingConfig& getSamplingConfig() override
+    {
+        return mSamplingConfig;
+    }
+
 private:
     BufferManager mManager;
-
-    common::CudaAllocator mAllocator;
     std::shared_ptr<tensorrt_llm::layers::DynamicDecodeLayer<T>> mDynamicDecodeLayer;
 
     TensorPtr mLogProbsTiled; // Buffer used to store the transpose of the logProbs. Needed because the kernels have
                               // been written to use that shape.
+    SamplingConfig mSamplingConfig;
 };
 
 inline std::unique_ptr<IGptDecoder> IGptDecoder::create(

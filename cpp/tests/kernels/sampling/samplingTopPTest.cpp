@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -87,7 +87,10 @@ private:
         // Perform batched TopP sampling
         tk::invokeBatchTopPSampling<T>(workspaceDevice->data(), workspaceSize, cubTempStorageSize,
             bufferCast<int*>(*this->mIdsPtrHost), bufferCast<int32_t>(*this->mSeqLengthsDevice),
-            bufferCast<bool>(*this->mFinishedDevice), bufferCast<bool>(*this->mFinishedDevice),
+            reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
+                bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice)),
+            reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
+                bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice)),
             bufferCast<float>(*this->mCumLogProbsDevice), bufferCast<float>(*this->mOutputLogProbsDevice),
             // Note that the kernel needs vocab probs instead of
             // log-prob if cum_log_probs or output_log_probs are

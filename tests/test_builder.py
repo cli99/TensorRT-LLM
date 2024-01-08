@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -70,6 +70,15 @@ class TestBuilder(unittest.TestCase):
         x = tensorrt_llm.functional.assertion
         x = tensorrt_llm.functional.einsum
         print(x)  # to avoid the delete of x
+
+
+class TestSubprocess(unittest.TestCase):
+
+    def import_using_popen(self):
+        import tensorrt_llm  # isort: skip
+        from subprocess import Popen
+
+        Popen(["python3", "-c", "import tensorrt_llm"])
 
 
 if __name__ == '__main__':

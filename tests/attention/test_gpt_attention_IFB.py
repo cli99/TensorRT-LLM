@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,13 +27,14 @@ import tensorrt as trt
 # isort: on
 from parameterized import parameterized
 from transformers import GPT2Config, GPTBigCodeConfig, GPTJConfig, LlamaConfig
+from transformers.cache_utils import DynamicCache
+from transformers.modeling_attn_mask_utils import (AttentionMaskConverter,
+                                                   _prepare_4d_attention_mask)
 from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
 from transformers.models.gpt_bigcode.modeling_gpt_bigcode import \
     GPTBigCodeAttention
 from transformers.models.gptj.modeling_gptj import GPTJAttention
-from transformers.models.llama.modeling_llama import (LlamaAttention,
-                                                      _expand_mask,
-                                                      _make_causal_mask)
+from transformers.models.llama.modeling_llama import LlamaAttention
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
@@ -137,6 +138,13 @@ class TestFunctional(unittest.TestCase):
                             "factor": 2.0
                         },
                     ]))
+
+        # test cases for StreamingLLM
+        test_cases += list(
+            product(['llama_attention'], [ContextFMHAType.disabled],
+                    ['float16'], [2], [128], [8], [4], [64], [0], [False],
+                    [False], [1], [False], [10000.0], [None], [4],
+                    [False, True]))
         return test_cases
 
     def custom_name_func(testcase_func, param_num, param):
@@ -161,7 +169,9 @@ class TestFunctional(unittest.TestCase):
                                beam_width,
                                fuse_bias,
                                rope_base=10000.0,
-                               rope_scaling=None):
+                               rope_scaling=None,
+                               sink_token_len=0,
+                               enable_pos_shift=False):
         if num_kv_heads == 0:
             num_kv_heads = num_heads
 
@@ -191,17 +201,19 @@ class TestFunctional(unittest.TestCase):
                     "ContextFMHAType with fp32 acc is not supported in pre-ampere architecture"
                 )
 
-        tokens_per_block = 16
+        tokens_per_block = 128
 
         remove_input_padding = True
 
         def _construct_execution(
-                session, input_tensor, weight, bias, pointer_array,
+                session, input_tensor, weight, bias, host_pointer_array,
                 sequence_length, host_past_key_value_lengths,
-                host_max_kv_cache_lengths, context_lengths, max_context_length,
-                cache_indirection, num_heads, hidden_size, num_kv_heads, output,
-                dtype, kv_int8_quant_scale, kv_int8_dequant_scale,
+                host_max_attention_window_sizes, host_sink_token_length,
+                context_lengths, max_context_length, cache_indirection,
+                num_heads, hidden_size, num_kv_heads, output, dtype,
+                kv_int8_quant_scale, kv_int8_dequant_scale,
                 host_context_lengths, host_request_types):
+            pointer_array = host_pointer_array.to('cuda')
             head_size = hidden_size // num_heads
             # construct trt network
             builder = tensorrt_llm.Builder()
@@ -225,9 +237,13 @@ class TestFunctional(unittest.TestCase):
                     name='host_past_key_value_lengths',
                     shape=tuple(host_past_key_value_lengths.shape),
                     dtype=tensorrt_llm.str_dtype_to_trt('int32'))
-                host_max_kv_cache_lengths_tensor = Tensor(
-                    name='host_max_kv_cache_lengths',
-                    shape=tuple(host_max_kv_cache_lengths.shape),
+                host_max_attention_window_sizes_tensor = Tensor(
+                    name='host_max_attention_window_sizes',
+                    shape=tuple(host_max_attention_window_sizes.shape),
+                    dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+                host_sink_token_length_tensor = Tensor(
+                    name='host_sink_token_length',
+                    shape=tuple(host_sink_token_length.shape),
                     dtype=tensorrt_llm.str_dtype_to_trt('int32'))
                 input_lengths_tensor = Tensor(
                     name='context_lengths',
@@ -243,6 +259,10 @@ class TestFunctional(unittest.TestCase):
                     dtype=tensorrt_llm.str_dtype_to_trt('int32'))
                 pointer_array_tensor = Tensor(
                     name='kv_cache_block_pointers',
+                    shape=tuple(pointer_array.shape),
+                    dtype=tensorrt_llm.str_dtype_to_trt('int64'))
+                host_pointer_array_tensor = Tensor(
+                    name='host_kv_cache_block_pointers',
                     shape=tuple(pointer_array.shape),
                     dtype=tensorrt_llm.str_dtype_to_trt('int64'))
                 kv_int8_quant_scale_tensor = None
@@ -312,12 +332,14 @@ class TestFunctional(unittest.TestCase):
                         }[configuration.rope_scaling["type"]]
                         rope_scale = configuration.rope_scaling["factor"]
                 outputs = tensorrt_llm.functional.gpt_attention(
-                    tensor=qkv,
+                    qkv=qkv,
                     past_key_value=None,
                     sequence_length=sequence_length_tensor,
                     host_past_key_value_lengths=
                     host_past_key_value_lengths_tensor,
-                    host_max_kv_cache_lengths=host_max_kv_cache_lengths_tensor,
+                    host_max_attention_window_sizes=
+                    host_max_attention_window_sizes_tensor,
+                    host_sink_token_length=host_sink_token_length_tensor,
                     context_lengths=input_lengths_tensor,
                     cache_indirection=cache_indirection_tensor,
                     host_request_types=host_request_types_tensor,
@@ -338,8 +360,10 @@ class TestFunctional(unittest.TestCase):
                         use_int8_kv_cache=use_int8_kv_cache),
                     max_context_length=max_context_length,
                     kv_cache_block_pointers=pointer_array_tensor,
+                    host_kv_cache_block_pointers=host_pointer_array_tensor,
                     host_context_lengths=host_context_lengths_tensor,
-                    qkv_bias=qkv_bias)
+                    qkv_bias=qkv_bias,
+                    enable_pos_shift=enable_pos_shift)
 
                 net._mark_output(outputs[0],
                                  'output',
@@ -349,11 +373,14 @@ class TestFunctional(unittest.TestCase):
                 'input': input_tensor,
                 'sequence_length': sequence_length,
                 'host_past_key_value_lengths': host_past_key_value_lengths,
-                'host_max_kv_cache_lengths': host_max_kv_cache_lengths,
+                'host_max_attention_window_sizes':
+                host_max_attention_window_sizes,
+                'host_sink_token_length': host_sink_token_length,
                 'context_lengths': context_lengths,
                 'cache_indirection': cache_indirection,
                 'host_request_types': host_request_types,
-                'kv_cache_block_pointers': pointer_array
+                'kv_cache_block_pointers': pointer_array,
+                'host_kv_cache_block_pointers': host_pointer_array
             }
             if use_int8_kv_cache:
                 inputs['kv_int8_quant_scale'] = kv_int8_quant_scale
@@ -395,9 +422,11 @@ class TestFunctional(unittest.TestCase):
         max_seq_len = in_len + out_len * 3
         num_req = batch_size
         in_lens = torch.randint(1, in_len + 1, (num_req, ))
-        max_blocks_per_seq = math.ceil(max_seq_len / tokens_per_block)
-        blocks = math.ceil(
-            (num_req * beam_width * max_seq_len) / tokens_per_block)
+        sink_tokens_in_last_block = sink_token_len % tokens_per_block
+        bubble_len = tokens_per_block - sink_tokens_in_last_block if sink_tokens_in_last_block > 0 else 0
+        max_blocks_per_seq = math.ceil(
+            (max_seq_len + bubble_len) / tokens_per_block)
+        blocks = num_req * beam_width * max_blocks_per_seq
         shape_dict = {
             'weight': (hidden_size, qkv_hidden_size),
             'bias': (qkv_hidden_size, ),
@@ -531,6 +560,7 @@ class TestFunctional(unittest.TestCase):
                     dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
                     device='cuda'),
                 requires_grad=False)
+            attention.layer_idx = 0
         elif attention_type == 'gptj_attention':
             q_w, k_w, v_w = torch.split(weight.transpose(
                 0, 1), [hidden_size, kv_hidden_size, kv_hidden_size],
@@ -548,6 +578,7 @@ class TestFunctional(unittest.TestCase):
                     dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
                     device='cuda'),
                 requires_grad=False)
+            attention.layer_idx = 0
         elif attention_type == 'gpt_bigcode_attention':
             attention.c_attn.weight = torch.nn.parameter.Parameter(
                 data=weight.transpose(0, 1).clone().detach(),
@@ -642,7 +673,7 @@ class TestFunctional(unittest.TestCase):
             if step != 0:
                 position_ids = position_ids[:, -1].unsqueeze(-1)
 
-            attention_mask = _expand_mask(
+            attention_mask = _prepare_4d_attention_mask(
                 ctx_attention_mask,
                 dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
                 tgt_len=(in_len if step == 0 else 1))
@@ -653,7 +684,7 @@ class TestFunctional(unittest.TestCase):
                     use_cache=True,
                     attention_mask=attention_mask)
             elif attention_type == 'llama_attention':
-                attention_mask = attention_mask + _make_causal_mask(
+                attention_mask = attention_mask + AttentionMaskConverter._make_causal_mask(
                     input.shape[:2],
                     dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
                     device='cuda',
@@ -696,6 +727,7 @@ class TestFunctional(unittest.TestCase):
                                           tokens_per_block,
                                           max_blocks_per_seq,
                                           max_seq_len,
+                                          sink_token_len,
                                           beam_width=beam_width)
 
         torch_cache_list = [None] * num_req
@@ -769,9 +801,12 @@ class TestFunctional(unittest.TestCase):
                 host_past_key_value_length_list,
                 dtype=torch.int32,
                 device='cpu').reshape(-1)
-            host_max_kv_cache_lengths = torch.tensor([max_seq_len],
-                                                     dtype=torch.int32,
-                                                     device='cpu')
+            host_max_attention_window_sizes = torch.tensor([max_seq_len],
+                                                           dtype=torch.int32,
+                                                           device='cpu')
+            host_sink_token_length = torch.tensor([0],
+                                                  dtype=torch.int32,
+                                                  device='cpu')
             total_num_tokens = int(sum(host_input_lengths))
             max_context_length = in_len
             context_lengths = host_context_lengths.cuda()
@@ -784,8 +819,8 @@ class TestFunctional(unittest.TestCase):
                                             device='cuda').reshape(-1)
 
             local_shape_dict = {
-                'input': (1, total_num_tokens, hidden_size),
-                'output': (1, total_num_tokens, hidden_size),
+                'input': (total_num_tokens, hidden_size),
+                'output': (total_num_tokens, hidden_size),
                 'past_key_value':
                 (blocks, 2, num_kv_heads, tokens_per_block, head_size),
                 'sequence_length': (num_seq, ),
@@ -812,10 +847,10 @@ class TestFunctional(unittest.TestCase):
             session, output = _construct_execution(
                 session, input_tensor, weight_plugin, bias_plugin,
                 dense_pointer_arrays, sequence_lengths,
-                host_past_key_value_lengths, host_max_kv_cache_lengths,
-                context_lengths, max_context_length, cache_indirection,
-                num_heads, hidden_size, num_kv_heads, output, dtype,
-                kv_int8_quant_scale, kv_int8_dequant_scale,
+                host_past_key_value_lengths, host_max_attention_window_sizes,
+                host_sink_token_length, context_lengths, max_context_length,
+                cache_indirection, num_heads, hidden_size, num_kv_heads, output,
+                dtype, kv_int8_quant_scale, kv_int8_dequant_scale,
                 host_context_lengths, host_request_types)
 
             del session
@@ -857,16 +892,36 @@ class TestFunctional(unittest.TestCase):
                 input_length = input_length_list[i][0]
                 local_beam_width = beam_width if step != 0 else 1
                 offset_next = offset + input_length * local_beam_width
-                torch_in = input_tensor[:, offset:offset_next, :].reshape(
-                    (local_beam_width, input_length, hidden_size))
-                torch_out, torch_cache_list[req_idx] = torch_exec(
+                if remove_input_padding:
+                    torch_in = input_tensor[offset:offset_next, :].reshape(
+                        (local_beam_width, input_length, hidden_size))
+                else:
+                    torch_in = input_tensor[:, offset:offset_next, :].reshape(
+                        (local_beam_width, input_length, hidden_size))
+
+                # llama uses DynamicCache
+                if attention_type == 'llama_attention':
+                    past_key_values = DynamicCache.from_legacy_cache(
+                        torch_cache_list[req_idx])
+                else:
+                    past_key_values = torch_cache_list[req_idx]
+
+                torch_out, past_key_values = torch_exec(
                     step, torch_in, ctx_attention_mask_list[req_idx], req_idx,
-                    torch_cache_list[req_idx])
+                    past_key_values)
+
+                # llama uses DynamicCache
+                if attention_type == 'llama_attention':
+                    torch_cache_list[req_idx] = past_key_values.to_legacy_cache(
+                    )
+                else:
+                    torch_cache_list[req_idx] = past_key_values
 
                 np.testing.assert_allclose(
-                    output[:, offset:offset_next, :].reshape(
-                        (local_beam_width, input_length,
-                         hidden_size)).cpu().numpy(),
+                    (output[offset:offset_next, :] if remove_input_padding else
+                     output[:, offset:offset_next, :]).reshape(
+                         (local_beam_width, input_length,
+                          hidden_size)).cpu().numpy(),
                     torch_out.cpu().numpy(),
                     atol=1e-3 if step == 0 else 2E-3)
                 offset = offset_next

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -25,7 +25,7 @@ project(${TARGET_NAME})
 set(CMAKE_VERBOSE_MAKEFILE 1)
 
 # Compile options
-set(CMAKE_C_FLAGS "-Wall -pthread ")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -pthread ")
 set(CMAKE_C_FLAGS_DEBUG "-g -O0")
 set(CMAKE_C_FLAGS_RELEASE "-O2")
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -lstdc++")

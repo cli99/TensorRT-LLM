@@ -18,6 +18,9 @@ RUN bash ./install_base.sh && rm install_base.sh
 COPY docker/common/install_cmake.sh install_cmake.sh
 RUN bash ./install_cmake.sh && rm install_cmake.sh
 
+COPY docker/common/install_ccache.sh install_ccache.sh
+RUN bash ./install_ccache.sh && rm install_ccache.sh
+
 # Download & install internal TRT release
 ARG TRT_VER CUDA_VER CUDNN_VER NCCL_VER CUBLAS_VER
 COPY docker/common/install_tensorrt.sh install_tensorrt.sh
@@ -60,7 +63,7 @@ FROM devel as release
 WORKDIR /app/tensorrt_llm
 COPY --from=wheel /src/tensorrt_llm/build/tensorrt_llm*.whl .
 COPY --from=wheel /src/tensorrt_llm/cpp/include/ include/
-RUN pip install tensorrt_llm*.whl && \
+RUN pip install tensorrt_llm*.whl --extra-index-url https://pypi.nvidia.com && \
     rm tensorrt_llm*.whl
 COPY README.md ./
 COPY examples examples

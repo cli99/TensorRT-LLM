@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -38,7 +38,7 @@ std::string vformat(char const* fmt, va_list args)
     std::string stringBuf(size, char{});
     auto const size2 = std::vsnprintf(&stringBuf[0], size + 1, fmt, args);
 
-    TLLM_CHECK_WITH_INFO(size2 == size, std::strerror(errno));
+    TLLM_CHECK_WITH_INFO(size2 == size, std::string(std::strerror(errno)));
 
     return stringBuf;
 }

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -127,13 +127,6 @@ class Session(object):
     def _print_io_info(self):
         '''print engine i/o info for debug purpose, internal use only.
         '''
-        for i in range(self.engine.num_bindings):
-            name = self.engine.get_binding_name(i)
-            dtype = self.engine.get_binding_dtype(i)
-            shape = self.engine.get_binding_shape(i)
-            is_input = self.engine.binding_is_input(i)
-            logger.info(
-                f"Binding:{i=:}, {name=:}, {dtype=:}, {shape=:}, {is_input=:}")
 
         for i in range(self.engine.num_io_tensors):
             name = self.engine.get_tensor_name(i)
