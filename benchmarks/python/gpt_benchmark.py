@@ -124,6 +124,7 @@ class GPTBenchmark(BaseBenchmark):
                 engine_buffer,
                 self.runtime_mapping,
                 cuda_graph_mode=self.cuda_graph_mode)
+        print(f'{self.quant_mode=}')
 
     def get_config(self):
         for inlen, outlen in self.in_out_lens:

@@ -196,6 +196,10 @@ def parse_arguments():
                         default=False,
                         action="store_true",
                         help='Output in CSV format.')
+    parser.add_argument('--print_header',
+                        default=True,
+                        type=bool,
+                        help='whether to print report header')
     parser.add_argument('--enable_cuda_graph',
                         default=False,
                         action='store_true',
@@ -306,8 +310,9 @@ def main(args):
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-    benchmarker.print_report_header(args.csv,
-                                    benchmark_profiler=benchmark_profiler)
+    if args.print_header:
+        benchmarker.print_header_header(args.csv,
+                                        benchmark_profiler=benchmark_profiler)
     for config in benchmarker.get_config():
         try:
             inputs = benchmarker.prepare_inputs(config)

@@ -134,10 +134,12 @@ class BaseBenchmark(object):
                                                  self.dtype,
                                                  self.world_size,
                                                  self.mode,
-                                                 fp8linear=int(self.enable_fp8))
+                                                 fp8linear=int(self.enable_fp8),
+                                                 quant_mode=str(
+                                                     self.quant_mode))
         return self.csv_filename
 
-    def print_report_header(self, csv=False, benchmark_profiler=None):
+    def print_header_header(self, csv=False, benchmark_profiler=None):
         if csv and self.runtime_rank == 0:
             report_dict = self.get_report_dict(benchmark_profiler)
             line = ",".join(report_dict.keys())
